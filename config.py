@@ -29,7 +29,7 @@ class CFG:
     original_sr: int = 700          # RespiBAN chest sensor sampling rate (Hz)
     target_sr: int = 128            # Downsample target (Hz)
     window_sec: float = 60.0        # Sliding window duration (seconds)
-    overlap: float = 0.5            # Overlap fraction (50 %)
+    overlap: float = 0.9            # Overlap fraction (90 % — more training data)
     # Derived: seq_len = int(target_sr * window_sec) = 7680
     seq_len: int = 7680
 
@@ -48,7 +48,7 @@ class CFG:
 
     # ── Filter design ──────────────────────────────────────────────────────
     ecg_bandpass: tuple = (0.5, 40.0)   # Hz  (Butterworth band-pass)
-    eda_lowpass: float = 5.0            # Hz  (Butterworth low-pass)
+    eda_bandpass: tuple = (0.05, 5.0)   # Hz  (Bandpass: 0.05 Hz removes tonic drift)
     filter_order: int = 4
 
     # ── Training — general ─────────────────────────────────────────────────
@@ -63,9 +63,9 @@ class CFG:
 
     # ── Knowledge Distillation ─────────────────────────────────────────────
     temperature: float = 4.0        # Softmax temperature T
-    alpha: float = 0.7              # Weight for task CE loss
-    beta: float = 0.3               # Weight for response-based KL loss
-    gamma: float = 0.2              # Weight for feature-based MSE loss
+    alpha: float = 0.9              # Weight for task CE loss (trust ground truth)
+    beta: float = 0.1               # Weight for response-based KL loss (less teacher trust)
+    gamma: float = 0.1              # Weight for feature-based MSE loss
 
     # ── Missing-modality simulation ────────────────────────────────────────
     missing_prob: float = 0.5       # Probability of dropping a modality

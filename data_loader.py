@@ -63,7 +63,7 @@ def filter_ecg(signal: np.ndarray, fs: int, cfg: CFG) -> np.ndarray:
 
 
 def filter_eda(signal: np.ndarray, fs: int, cfg: CFG) -> np.ndarray:
-    """Apply low-pass filter to EDA signal.
+    """Apply band-pass filter to extract phasic EDA component (removing drift).
 
     Args:
         signal: Raw EDA, shape ``(N,)``
@@ -73,7 +73,7 @@ def filter_eda(signal: np.ndarray, fs: int, cfg: CFG) -> np.ndarray:
     Returns:
         Filtered EDA, shape ``(N,)``
     """
-    sos = _butter_lowpass(cfg.eda_lowpass, fs, cfg.filter_order)
+    sos = _butter_bandpass(cfg.eda_bandpass[0], cfg.eda_bandpass[1], fs, cfg.filter_order)
     return sosfiltfilt(sos, signal).astype(np.float32)
 
 
