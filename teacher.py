@@ -19,6 +19,8 @@ attention weights can be used for feature-based knowledge distillation.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -197,6 +199,33 @@ class CrossAttentionLayer(nn.Module):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Positional Encoding (sinusoidal)
+# ════════════════════════════════════════════════════════════════════════════
+
+class PositionalEncoding1D(nn.Module):
+    """Inject temporal (sequence-order) information into a tensor."""
+
+    def __init__(self, d_model: int, max_len: int = 5000) -> None:
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor with shape ``(B, Seq_Len, D_model)``
+        """
+        x = x + self.pe[:x.size(1)].transpose(0, 1)
+        return x
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Teacher Model
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -226,6 +255,9 @@ class TeacherModel(nn.Module):
             stage_channels=cfg.resnet_channels,
             blocks_per_stage=cfg.resnet_blocks_per_stage,
         )
+
+        # Positional encoding (shared across both modalities)
+        self.pos_encoder = PositionalEncoding1D(d_model=cfg.attn_dim)
 
         # Cross-attention layers
         self.cross_attn_ecg2eda = CrossAttentionLayer(
@@ -268,6 +300,10 @@ class TeacherModel(nn.Module):
         # Transpose to (B, T', D) for attention
         feat_ecg_t = feat_ecg.permute(0, 2, 1)  # shape: (B, T', 256)
         feat_eda_t = feat_eda.permute(0, 2, 1)  # shape: (B, T', 256)
+
+        # Inject temporal position before attention
+        feat_ecg_t = self.pos_encoder(feat_ecg_t)
+        feat_eda_t = self.pos_encoder(feat_eda_t)
 
         # Cross-attention: ECG queries EDA
         fused_ecg, attn_ecg2eda = self.cross_attn_ecg2eda(
