@@ -56,16 +56,16 @@ class CFG:
     num_workers: int = 0 if os.name == "nt" else 2  # 0 on Windows to avoid hangs
     epochs_teacher: int = 80
     epochs_student: int = 80
-    lr: float = 5e-4
+    lr: float = 7e-4
     weight_decay: float = 1e-1
     early_stopping_patience: int = 10  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
 
     # ── Knowledge Distillation ─────────────────────────────────────────────
     temperature: float = 4.0        # Softmax temperature T
-    alpha: float = 0.9              # Weight for task CE loss (trust ground truth)
-    beta: float = 0.1               # Weight for response-based KL loss (less teacher trust)
-    gamma: float = 0.1              # Weight for feature-based MSE loss
+    alpha: float = 0.5              # Weight for task CE loss
+    beta: float = 0.5               # Weight for response-based KL loss (trust teacher)
+    gamma: float = 1.0              # Weight for feature-based MSE loss (force SE→Attn match)
 
     # ── Missing-modality simulation ────────────────────────────────────────
     missing_prob: float = 0.5       # Probability of dropping a modality
@@ -81,7 +81,7 @@ class CFG:
 
     # ── Student architecture ───────────────────────────────────────────────
     student_channels: List[int] = field(
-        default_factory=lambda: [32, 64, 128]
+        default_factory=lambda: [64, 128, 256]  # 2x capacity for augmented data
     )
     se_reduction: int = 4
 
