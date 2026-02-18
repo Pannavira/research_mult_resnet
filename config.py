@@ -55,15 +55,15 @@ class CFG:
     num_workers: int = 0 if os.name == "nt" else 2  # 0 on Windows to avoid hangs
     epochs_teacher: int = 80
     epochs_student: int = 80
-    lr: float = 1e-3
-    weight_decay: float = 1e-2
+    lr: float = 5e-4
+    weight_decay: float = 1e-1
     early_stopping_patience: int = 10  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
 
     # ── Knowledge Distillation ─────────────────────────────────────────────
     temperature: float = 4.0        # Softmax temperature T
-    alpha: float = 0.4              # Weight for task CE loss
-    beta: float = 0.4               # Weight for response-based KL loss
+    alpha: float = 0.7              # Weight for task CE loss
+    beta: float = 0.3               # Weight for response-based KL loss
     gamma: float = 0.2              # Weight for feature-based MSE loss
 
     # ── Missing-modality simulation ────────────────────────────────────────
