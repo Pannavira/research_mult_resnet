@@ -57,6 +57,7 @@ class CFG:
     epochs_student: int = 80
     lr: float = 1e-3
     weight_decay: float = 1e-2
+    early_stopping_patience: int = 10  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
 
     # ── Knowledge Distillation ─────────────────────────────────────────────

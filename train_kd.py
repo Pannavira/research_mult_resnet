@@ -240,12 +240,23 @@ def train_teacher(
     device = cfg.device
     teacher = teacher.to(device)
 
+    # ── Compute inverse-frequency class weights from training data ──────
+    train_ds = train_loader.dataset
+    labels = train_ds.labels  # numpy array from WESADDataset
+    class_counts = np.bincount(labels, minlength=cfg.num_classes).astype(np.float32)
+    class_weights = (1.0 / class_counts) * class_counts.sum() / cfg.num_classes
+    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    print(f"[Teacher] Class counts : {class_counts.astype(int).tolist()}")
+    print(f"[Teacher] Class weights: {class_weights.tolist()}")
+
     optimizer = AdamW(teacher.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs_teacher)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     scaler = GradScaler() if _USE_CUDA else GradScaler()
 
     best_val_acc = 0.0
+    best_val_loss = float("inf")
+    patience_counter = 0
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
     for epoch in range(1, cfg.epochs_teacher + 1):
@@ -282,10 +293,23 @@ def train_teacher(
             f"[Teacher] Epoch {epoch:3d}/{cfg.epochs_teacher} │ "
             f"Train Loss {train_loss:.4f}  Acc {train_acc:.1f}% │ "
             f"Val Loss {val_loss:.4f}  Acc {val_acc:.1f}%  F1 {val_f1:.3f} │ "
-            f"LR {scheduler.get_last_lr()[0]:.2e}"
+            f"LR {scheduler.get_last_lr()[0]:.2e}  "
+            f"ES {patience_counter}/{cfg.early_stopping_patience}"
         )
 
-        # Save best
+        # ── Early stopping on val loss ─────────────────────────────────────
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= cfg.early_stopping_patience:
+            print(f"[Teacher] Early stopping triggered at epoch {epoch} "
+                  f"(val loss did not improve for {cfg.early_stopping_patience} epochs)")
+            break
+
+        # Save best (based on val accuracy)
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(
