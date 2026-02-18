@@ -36,13 +36,14 @@ class CFG:
     # ── Label mapping ──────────────────────────────────────────────────────
     #   Original WESAD labels: 0=not defined, 1=baseline, 2=stress,
     #   3=amusement, 4=meditation, 5/6/7=ignore.
-    #   We keep 1, 2, 3 and remap to 0-indexed: {1→0, 2→1, 3→2}
+    #   BINARY: Baseline (1) and Amusement (3) → Non-Stress (0).
+    #           Stress (2) → Stress (1).
     label_map: dict = field(
-        default_factory=lambda: {1: 0, 2: 1, 3: 2}
+        default_factory=lambda: {1: 0, 2: 1, 3: 0}
     )
-    num_classes: int = 3
+    num_classes: int = 2
     class_names: List[str] = field(
-        default_factory=lambda: ["Baseline", "Stress", "Amusement"]
+        default_factory=lambda: ["Non-Stress", "Stress"]
     )
 
     # ── Filter design ──────────────────────────────────────────────────────
