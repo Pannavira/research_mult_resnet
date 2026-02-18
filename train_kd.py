@@ -106,6 +106,7 @@ class KDLoss(nn.Module):
         cfg: CFG,
         student_dims: List[int],
         teacher_attn_dim: int,          # kept for API compat (unused now)
+        class_weights: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         self.alpha = cfg.alpha
@@ -113,7 +114,7 @@ class KDLoss(nn.Module):
         self.gamma = cfg.gamma
         self.T = cfg.temperature
 
-        self.ce = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss(weight=class_weights)
 
         # Adaptive pool compresses teacher attention summary (T' → ALIGN_DIM)
         self.attn_pool = nn.AdaptiveAvgPool1d(self.ALIGN_DIM)
@@ -372,9 +373,22 @@ def train_student_kd(
     print(f"[KD] Teacher attention flattened dim: {teacher_attn_dim}")
     print(f"[KD] Using compact alignment dim: {KDLoss.ALIGN_DIM}")
 
+    # ── Compute inverse-frequency class weights from training data ──────
+    base_ds = train_loader.dataset
+    # Unwrap MissingModalityWrapper if needed to access .labels
+    if hasattr(base_ds, 'base'):
+        base_ds = base_ds.base
+    labels = base_ds.labels
+    class_counts = np.bincount(labels, minlength=cfg.num_classes).astype(np.float32)
+    class_weights = (1.0 / class_counts) * class_counts.sum() / cfg.num_classes
+    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    print(f"[KD] Class counts : {class_counts.astype(int).tolist()}")
+    print(f"[KD] Class weights: {class_weights.tolist()}")
+
     # Build KD loss
     student_dims = cfg.student_channels  # [32, 64, 128]
-    kd_loss_fn = KDLoss(cfg, student_dims, teacher_attn_dim).to(device)
+    kd_loss_fn = KDLoss(cfg, student_dims, teacher_attn_dim,
+                        class_weights=class_weights).to(device)
 
     # Optimizer covers both student parameters AND the projector parameters
     all_params = list(student.parameters()) + list(kd_loss_fn.projectors.parameters())
