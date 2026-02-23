@@ -216,9 +216,9 @@ class WESADDataset(Dataset):
         self.eda = np.concatenate(all_eda, axis=0)       # (N_total, seq_len)
         self.labels = np.concatenate(all_labels, axis=0) # (N_total,)
 
-        # Z-score normalisation (per-channel, across dataset)
-        self.ecg = (self.ecg - self.ecg.mean()) / (self.ecg.std() + 1e-8)
-        self.eda = (self.eda - self.eda.mean()) / (self.eda.std() + 1e-8)
+        # Per-window normalisation
+        self.ecg = (self.ecg - self.ecg.mean(axis=1, keepdims=True)) / (self.ecg.std(axis=1, keepdims=True) + 1e-8)
+        self.eda = (self.eda - self.eda.mean(axis=1, keepdims=True)) / (self.eda.std(axis=1, keepdims=True) + 1e-8)
 
         print(f"  [data_loader] Dataset ready — {len(self)} windows, "
               f"class distribution: {np.bincount(self.labels).tolist()}")

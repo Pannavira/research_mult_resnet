@@ -71,7 +71,7 @@ class DepthwiseSeparableConv1d(nn.Module):
             groups=in_channels,   # ← one filter per channel
             bias=False,
         )
-        self.bn1 = nn.BatchNorm1d(in_channels)
+        self.bn1 = nn.InstanceNorm1d(in_channels, affine=True)
 
         # Pointwise: 1×1 conv to project to out_channels
         self.pointwise = nn.Conv1d(
@@ -79,7 +79,7 @@ class DepthwiseSeparableConv1d(nn.Module):
             kernel_size=1,
             bias=False,
         )
-        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.bn2 = nn.InstanceNorm1d(out_channels, affine=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

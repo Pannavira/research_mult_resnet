@@ -244,9 +244,9 @@ def run_fold(
     )
 
     # ── Build train + val loaders ──────────────────────────────────────
-    # Use last train subject as validation
-    val_subject = train_subjects[-1]
-    actual_train = train_subjects[:-1]
+    # Use last two train subjects as validation to reduce fold-bias
+    val_subjects = train_subjects[-2:]
+    actual_train = train_subjects[:-2]
 
     print(f"  Loading train data ({actual_train}) ...")
     train_ds = WESADDataset(actual_train, cfg)
@@ -256,8 +256,8 @@ def run_fold(
         drop_last=True,
     )
 
-    print(f"  Loading val data ({val_subject}) ...")
-    val_ds = WESADDataset([val_subject], cfg)
+    print(f"  Loading val data ({val_subjects}) ...")
+    val_ds = WESADDataset(val_subjects, cfg)
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=torch.cuda.is_available(),

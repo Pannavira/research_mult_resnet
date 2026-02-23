@@ -44,18 +44,19 @@ class ResidualBlock1D(nn.Module):
         stride: Stride for the first convolution (used for downsampling).
     """
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 2) -> None:
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 2, dropout: float = 0.3) -> None:
         super().__init__()
         self.conv1 = nn.Conv1d(
             in_channels, out_channels, kernel_size=7, stride=stride,
             padding=3, bias=False,
         )
-        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.bn1 = nn.InstanceNorm1d(out_channels, affine=True)
         self.conv2 = nn.Conv1d(
             out_channels, out_channels, kernel_size=7, stride=1,
             padding=3, bias=False,
         )
-        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.bn2 = nn.InstanceNorm1d(out_channels, affine=True)
+        self.dropout = nn.Dropout1d(p=dropout)
 
         # Skip connection projection
         self.skip = nn.Identity()
@@ -63,7 +64,7 @@ class ResidualBlock1D(nn.Module):
             self.skip = nn.Sequential(
                 nn.Conv1d(in_channels, out_channels, kernel_size=1,
                           stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels),
+                nn.InstanceNorm1d(out_channels, affine=True),
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -76,6 +77,7 @@ class ResidualBlock1D(nn.Module):
         """
         identity = self.skip(x)       # shape: (B, C_out, L')
         out = F.relu(self.bn1(self.conv1(x)))  # shape: (B, C_out, L')
+        out = self.dropout(out)                # ADDED DROPOUT
         out = self.bn2(self.conv2(out))        # shape: (B, C_out, L')
         return F.relu(out + identity)          # shape: (B, C_out, L')
 
@@ -110,7 +112,7 @@ class Deep1DResNet(nn.Module):
         self.stem = nn.Sequential(
             nn.Conv1d(in_channels, stage_channels[0], kernel_size=15,
                       stride=2, padding=7, bias=False),
-            nn.BatchNorm1d(stage_channels[0]),
+            nn.InstanceNorm1d(stage_channels[0], affine=True),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
         )  # output shape: (B, 64, L//4)

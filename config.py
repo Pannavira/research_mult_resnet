@@ -74,11 +74,11 @@ class CFG:
 
     # ── Teacher architecture ───────────────────────────────────────────────
     resnet_channels: List[int] = field(
-        default_factory=lambda: [16, 32, 64]
+        default_factory=lambda: [32, 64, 128]
     )
     resnet_blocks_per_stage: int = 2
     attn_heads: int = 4
-    attn_dim: int = 64             # Must match last resnet channel
+    attn_dim: int = 128             # Must match last resnet channel
 
     # ── Student architecture ───────────────────────────────────────────────
     student_channels: List[int] = field(
