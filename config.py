@@ -29,7 +29,7 @@ class CFG:
     original_sr: int = 700          # RespiBAN chest sensor sampling rate (Hz)
     target_sr: int = 128            # Downsample target (Hz)
     window_sec: float = 60.0        # Sliding window duration (seconds)
-    overlap: float = 0.9            # Overlap fraction (90 % — more training data)
+    overlap: float = 0.5            # Overlap fraction (50%). Lower = less memorization
     # Derived: seq_len = int(target_sr * window_sec) = 7680
     seq_len: int = 7680
 
@@ -56,11 +56,11 @@ class CFG:
     num_workers: int = 0 if os.name == "nt" else 2  # 0 on Windows to avoid hangs
     epochs_teacher: int = 100
     epochs_student: int = 80
-    lr: float = 5e-5
+    lr: float = 1e-4
     weight_decay: float = 1e-2
     early_stopping_patience: int = 150  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
-    noise_std: float = 0.05         # Standard deviation for Gaussian noise augmentation
+    noise_std: float = 0.1          # Standard deviation for Gaussian noise augmentation
 
     # ── Knowledge Distillation ─────────────────────────────────────────────
     temperature: float = 4.0        # Softmax temperature T
