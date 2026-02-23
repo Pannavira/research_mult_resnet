@@ -259,8 +259,8 @@ class TeacherModel(nn.Module):
             blocks_per_stage=cfg.resnet_blocks_per_stage,
         )
 
-        # Positional encoding — DISABLED: causes overfitting on small datasets
-        # self.pos_encoder = PositionalEncoding1D(d_model=cfg.attn_dim)
+        # Positional encoding (dropout=0.5 to prevent overfitting on small datasets)
+        self.pos_encoder = PositionalEncoding1D(d_model=cfg.attn_dim)
 
         # Cross-attention layers
         self.cross_attn_ecg2eda = CrossAttentionLayer(
@@ -304,9 +304,9 @@ class TeacherModel(nn.Module):
         feat_ecg_t = feat_ecg.permute(0, 2, 1)  # shape: (B, T', 256)
         feat_eda_t = feat_eda.permute(0, 2, 1)  # shape: (B, T', 256)
 
-        # Positional encoding — DISABLED (see __init__)
-        # feat_ecg_t = self.pos_encoder(feat_ecg_t)
-        # feat_eda_t = self.pos_encoder(feat_eda_t)
+        # Positional encoding — inject temporal info
+        feat_ecg_t = self.pos_encoder(feat_ecg_t)
+        feat_eda_t = self.pos_encoder(feat_eda_t)
 
         # Cross-attention: ECG queries EDA
         fused_ecg, attn_ecg2eda = self.cross_attn_ecg2eda(

@@ -243,6 +243,9 @@ def train_teacher(
 
     # ── Compute inverse-frequency class weights from training data ──────
     train_ds = train_loader.dataset
+    # Unwrap MissingModalityWrapper if needed to access .labels
+    if hasattr(train_ds, 'base'):
+        train_ds = train_ds.base
     labels = train_ds.labels  # numpy array from WESADDataset
     class_counts = np.bincount(labels, minlength=cfg.num_classes).astype(np.float32)
     class_weights = (1.0 / class_counts) * class_counts.sum() / cfg.num_classes
@@ -602,7 +605,7 @@ def main() -> None:
             cfg,
             train_subjects=train_subjects,
             val_subjects=val_subjects,
-            wrap_missing=False,
+            wrap_missing=True,   # Teacher also trained with missing-modality augmentation
         )
         teacher = train_teacher(teacher, train_loader, val_loader, cfg)
 

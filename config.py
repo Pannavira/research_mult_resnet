@@ -52,12 +52,12 @@ class CFG:
     filter_order: int = 4
 
     # ── Training — general ─────────────────────────────────────────────────
-    batch_size: int = 32
+    batch_size: int = 256 #test untuk google colab
     num_workers: int = 0 if os.name == "nt" else 2  # 0 on Windows to avoid hangs
-    epochs_teacher: int = 80
+    epochs_teacher: int = 150
     epochs_student: int = 80
-    lr: float = 7e-4
-    weight_decay: float = 1e-1
+    lr: float = 1e-4
+    weight_decay: float = 1e-4
     early_stopping_patience: int = 10  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
 
@@ -69,7 +69,7 @@ class CFG:
 
     # ── Missing-modality simulation ────────────────────────────────────────
     missing_prob: float = 0.5       # Probability of dropping a modality
-    drop_modality: str = "eda"      # Which modality to drop ("eda", "ecg", or "random")
+    drop_modality: str = "random"      # Which modality to drop ("eda", "ecg", or "random")
 
     # ── Teacher architecture ───────────────────────────────────────────────
     resnet_channels: List[int] = field(
