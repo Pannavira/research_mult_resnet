@@ -57,7 +57,7 @@ class CFG:
     epochs_teacher: int = 150
     epochs_student: int = 80
     lr: float = 5e-5
-    weight_decay: float = 1e-3
+    weight_decay: float = 1e-2
     early_stopping_patience: int = 150  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
 
@@ -73,11 +73,11 @@ class CFG:
 
     # ── Teacher architecture ───────────────────────────────────────────────
     resnet_channels: List[int] = field(
-        default_factory=lambda: [32, 64, 128]
+        default_factory=lambda: [16, 32, 64]
     )
     resnet_blocks_per_stage: int = 2
     attn_heads: int = 4
-    attn_dim: int = 128             # Must match last resnet channel
+    attn_dim: int = 64             # Must match last resnet channel
 
     # ── Student architecture ───────────────────────────────────────────────
     student_channels: List[int] = field(
