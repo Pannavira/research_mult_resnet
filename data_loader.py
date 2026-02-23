@@ -206,6 +206,10 @@ class WESADDataset(Dataset):
             min_len = min(len(ecg_ds), len(eda_ds), len(lbl_ds))
             ecg_ds, eda_ds, lbl_ds = ecg_ds[:min_len], eda_ds[:min_len], lbl_ds[:min_len]
 
+            # Global subject-wise Z-score normalization
+            ecg_ds = (ecg_ds - ecg_ds.mean()) / (ecg_ds.std() + 1e-8)
+            eda_ds = (eda_ds - eda_ds.mean()) / (eda_ds.std() + 1e-8)
+
             # Segment into windows
             ecg_w, eda_w, lbl_w = _segment_windows(ecg_ds, eda_ds, lbl_ds, cfg)
             all_ecg.append(ecg_w)
@@ -216,9 +220,7 @@ class WESADDataset(Dataset):
         self.eda = np.concatenate(all_eda, axis=0)       # (N_total, seq_len)
         self.labels = np.concatenate(all_labels, axis=0) # (N_total,)
 
-        # Per-window normalisation
-        self.ecg = (self.ecg - self.ecg.mean(axis=1, keepdims=True)) / (self.ecg.std(axis=1, keepdims=True) + 1e-8)
-        self.eda = (self.eda - self.eda.mean(axis=1, keepdims=True)) / (self.eda.std(axis=1, keepdims=True) + 1e-8)
+
 
         print(f"  [data_loader] Dataset ready — {len(self)} windows, "
               f"class distribution: {np.bincount(self.labels).tolist()}")

@@ -52,13 +52,13 @@ class CFG:
     filter_order: int = 4
 
     # ── Training — general ─────────────────────────────────────────────────
-    batch_size: int = 256 #test untuk google colab
-    num_workers: int = 0 if os.name == "nt" else 2  # 0 on Windows to avoid hangs
+    batch_size: int = 32
+    num_workers: int = 4 # 0 on Windows to avoid hangs
     epochs_teacher: int = 100
     epochs_student: int = 80
     lr: float = 1e-4
     weight_decay: float = 1e-2
-    early_stopping_patience: int = 150  # Stop if val loss doesn't improve for N epochs
+    early_stopping_patience: int = 25  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
     noise_std: float = 0.1          # Standard deviation for Gaussian noise augmentation
 
