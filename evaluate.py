@@ -266,7 +266,7 @@ def run_fold(
     # ── Teacher ────────────────────────────────────────────────────────
     teacher = TeacherModel(cfg)
 
-    if phase in ("both",):
+    if phase in ("both", "teacher"):
         print(f"  Training Teacher ...")
         teacher = train_teacher(teacher, train_loader, val_loader, cfg)
     elif teacher_ckpt and os.path.exists(teacher_ckpt):
@@ -309,7 +309,7 @@ def run_fold(
         student = train_student_kd(
             teacher, student, train_loader_kd, val_loader, cfg,
         )
-    else:
+    elif phase != "teacher":
         student = StudentModel(cfg)
         stu_ckpt = os.path.join(cfg.checkpoint_dir, "student_best.pt")
         if os.path.exists(stu_ckpt):
@@ -318,46 +318,50 @@ def run_fold(
             )
         student = student.to(device).eval()
 
-    # Evaluate Student — 3 scenarios
-    print(f"  Evaluating Student on {test_subject} ...")
+    # Evaluate Student — 3 scenarios (skip if evaluating teacher only)
+    if phase != "teacher":
+        print(f"  Evaluating Student on {test_subject} ...")
 
-    # 1. Full modality
-    s_logits, s_targets = collect_predictions(student, test_loader, device)
-    result.student_full_metrics = compute_detailed_metrics(
-        s_logits, s_targets, cfg.class_names
-    )
-    result.student_cm = compute_confusion_matrix(s_logits, s_targets, cfg.num_classes)
+        # 1. Full modality
+        s_logits, s_targets = collect_predictions(student, test_loader, device)
+        result.student_full_metrics = compute_detailed_metrics(
+            s_logits, s_targets, cfg.class_names
+        )
+        result.student_cm = compute_confusion_matrix(s_logits, s_targets, cfg.num_classes)
 
-    # 2. Missing EDA (drop channel 1)
-    s_logits_no_eda, _ = collect_predictions_missing(
-        student, test_loader, device, drop_channel=1
-    )
-    result.student_no_eda_metrics = compute_detailed_metrics(
-        s_logits_no_eda, s_targets, cfg.class_names
-    )
+        # 2. Missing EDA (drop channel 1)
+        s_logits_no_eda, _ = collect_predictions_missing(
+            student, test_loader, device, drop_channel=1
+        )
+        result.student_no_eda_metrics = compute_detailed_metrics(
+            s_logits_no_eda, s_targets, cfg.class_names
+        )
 
-    # 3. Missing ECG (drop channel 0)
-    s_logits_no_ecg, _ = collect_predictions_missing(
-        student, test_loader, device, drop_channel=0
-    )
-    result.student_no_ecg_metrics = compute_detailed_metrics(
-        s_logits_no_ecg, s_targets, cfg.class_names
-    )
+        # 3. Missing ECG (drop channel 0)
+        s_logits_no_ecg, _ = collect_predictions_missing(
+            student, test_loader, device, drop_channel=0
+        )
+        result.student_no_ecg_metrics = compute_detailed_metrics(
+            s_logits_no_ecg, s_targets, cfg.class_names
+        )
 
     # ── Print fold summary ────────────────────────────────────────────
     print(f"\n  ╔═══ Fold {test_subject} Results ═══")
-    print(f"  ║ Teacher         : Acc={result.teacher_metrics['accuracy']:.1f}%  "
-          f"F1={result.teacher_metrics['macro_f1']:.3f}")
-    print(f"  ║ Student (full)  : Acc={result.student_full_metrics['accuracy']:.1f}%  "
-          f"F1={result.student_full_metrics['macro_f1']:.3f}")
-    print(f"  ║ Student (no EDA): Acc={result.student_no_eda_metrics['accuracy']:.1f}%  "
-          f"F1={result.student_no_eda_metrics['macro_f1']:.3f}")
-    print(f"  ║ Student (no ECG): Acc={result.student_no_ecg_metrics['accuracy']:.1f}%  "
-          f"F1={result.student_no_ecg_metrics['macro_f1']:.3f}")
+    print(f"  ║ Teacher         : Acc={result.teacher_metrics.get('accuracy', 0.0):.1f}%  "
+          f"F1={result.teacher_metrics.get('macro_f1', 0.0):.3f}")
+    if phase != "teacher":
+        print(f"  ║ Student (full)  : Acc={result.student_full_metrics.get('accuracy', 0.0):.1f}%  "
+              f"F1={result.student_full_metrics.get('macro_f1', 0.0):.3f}")
+        print(f"  ║ Student (no EDA): Acc={result.student_no_eda_metrics.get('accuracy', 0.0):.1f}%  "
+              f"F1={result.student_no_eda_metrics.get('macro_f1', 0.0):.3f}")
+        print(f"  ║ Student (no ECG): Acc={result.student_no_ecg_metrics.get('accuracy', 0.0):.1f}%  "
+              f"F1={result.student_no_ecg_metrics.get('macro_f1', 0.0):.3f}")
     print(f"  ╚{'═' * 35}")
 
     # Clean up GPU memory between folds
-    del teacher, student
+    if 'student' in locals():
+        del student
+    del teacher
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -380,10 +384,14 @@ def aggregate_results(
     # ── Collect per-fold numbers ──────────────────────────────────────
     scenarios = {
         "Teacher (full)": "teacher_metrics",
-        "Student (full)": "student_full_metrics",
-        "Student (no EDA)": "student_no_eda_metrics",
-        "Student (no ECG)": "student_no_ecg_metrics",
     }
+    
+    if any(r.student_full_metrics for r in fold_results):
+        scenarios.update({
+            "Student (full)": "student_full_metrics",
+            "Student (no EDA)": "student_no_eda_metrics",
+            "Student (no ECG)": "student_no_ecg_metrics",
+        })
 
     print("\n" + "=" * 80)
     print("  LOSO Cross-Validation — Aggregated Results")
@@ -429,9 +437,10 @@ def aggregate_results(
     teacher_cm = sum(r.teacher_cm for r in fold_results)
     print(format_confusion_matrix(teacher_cm, cfg.class_names))
 
-    print("\n  Aggregated Confusion Matrix — Student (full modality)")
-    student_cm = sum(r.student_cm for r in fold_results)
-    print(format_confusion_matrix(student_cm, cfg.class_names))
+    if any(r.student_full_metrics for r in fold_results):
+        print("\n  Aggregated Confusion Matrix — Student (full modality)")
+        student_cm = sum(r.student_cm for r in fold_results)
+        print(format_confusion_matrix(student_cm, cfg.class_names))
 
     # ── Per-fold detail table ─────────────────────────────────────────
     print(f"\n{'─' * 80}")
@@ -439,11 +448,14 @@ def aggregate_results(
           f"{'Stu(noEDA)':>12s} {'Stu(noECG)':>12s}")
     print(f"{'─' * 80}")
     for r in fold_results:
+        stu_full_acc = r.student_full_metrics.get("accuracy", 0.0)
+        stu_no_eda_acc = r.student_no_eda_metrics.get("accuracy", 0.0)
+        stu_no_ecg_acc = r.student_no_ecg_metrics.get("accuracy", 0.0)
         print(f"{r.test_subject:<8s} "
-              f"{r.teacher_metrics['accuracy']:>11.1f}% "
-              f"{r.student_full_metrics['accuracy']:>11.1f}% "
-              f"{r.student_no_eda_metrics['accuracy']:>11.1f}% "
-              f"{r.student_no_ecg_metrics['accuracy']:>11.1f}%")
+              f"{r.teacher_metrics.get('accuracy', 0.0):>11.1f}% "
+              f"{stu_full_acc:>11.1f}% "
+              f"{stu_no_eda_acc:>11.1f}% "
+              f"{stu_no_ecg_acc:>11.1f}%")
 
     # ── Model size comparison ─────────────────────────────────────────
     teacher = TeacherModel(cfg)
@@ -481,19 +493,23 @@ def aggregate_results(
         for r in fold_results:
             writer.writerow([
                 r.test_subject,
-                f"{r.teacher_metrics['accuracy']:.2f}",
-                f"{r.teacher_metrics['macro_f1']:.4f}",
-                f"{r.student_full_metrics['accuracy']:.2f}",
-                f"{r.student_full_metrics['macro_f1']:.4f}",
-                f"{r.student_no_eda_metrics['accuracy']:.2f}",
-                f"{r.student_no_eda_metrics['macro_f1']:.4f}",
-                f"{r.student_no_ecg_metrics['accuracy']:.2f}",
-                f"{r.student_no_ecg_metrics['macro_f1']:.4f}",
+                f"{r.teacher_metrics.get('accuracy', 0.0):.2f}",
+                f"{r.teacher_metrics.get('macro_f1', 0.0):.4f}",
+                f"{r.student_full_metrics.get('accuracy', 0.0):.2f}",
+                f"{r.student_full_metrics.get('macro_f1', 0.0):.4f}",
+                f"{r.student_no_eda_metrics.get('accuracy', 0.0):.2f}",
+                f"{r.student_no_eda_metrics.get('macro_f1', 0.0):.4f}",
+                f"{r.student_no_ecg_metrics.get('accuracy', 0.0):.2f}",
+                f"{r.student_no_ecg_metrics.get('macro_f1', 0.0):.4f}",
             ])
     print(f"  Per-fold saved to: {fold_csv}")
 
     # Confusion matrix CSV
-    for name, cm in [("teacher", teacher_cm), ("student", student_cm)]:
+    matrices_to_save = [("teacher", teacher_cm)]
+    if any(r.student_full_metrics for r in fold_results):
+        matrices_to_save.append(("student", student_cm))
+        
+    for name, cm in matrices_to_save:
         cm_csv = os.path.join(results_dir, f"confusion_matrix_{name}.csv")
         with open(cm_csv, "w", newline="") as f:
             writer = csv.writer(f)
@@ -521,8 +537,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--phase", type=str, default="both",
-        choices=["both", "student", "eval"],
+        choices=["both", "teacher", "student", "eval"],
         help="'both' = train teacher+student per fold, "
+             "'teacher' = evaluate teacher only per fold, "
              "'student' = use pre-trained teacher, "
              "'eval' = evaluate pre-trained checkpoints only.",
     )
