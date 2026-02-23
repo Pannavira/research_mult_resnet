@@ -155,7 +155,7 @@ class CrossAttentionLayer(nn.Module):
     """
 
     def __init__(self, d_model: int = 256, n_heads: int = 4,
-                 dropout: float = 0.1) -> None:
+                 dropout: float = 0.3) -> None:
         super().__init__()
         self.attn = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=n_heads,
@@ -275,7 +275,7 @@ class TeacherModel(nn.Module):
         self.classifier = nn.Sequential(
             nn.Linear(cfg.attn_dim * 2, cfg.attn_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),
             nn.Linear(cfg.attn_dim, cfg.num_classes),
         )
 

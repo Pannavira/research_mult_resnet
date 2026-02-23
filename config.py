@@ -56,8 +56,8 @@ class CFG:
     num_workers: int = 0 if os.name == "nt" else 2  # 0 on Windows to avoid hangs
     epochs_teacher: int = 150
     epochs_student: int = 80
-    lr: float = 1e-4
-    weight_decay: float = 1e-4
+    lr: float = 5e-5
+    weight_decay: float = 1e-3
     early_stopping_patience: int = 150  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
 
