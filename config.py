@@ -54,12 +54,13 @@ class CFG:
     # ── Training — general ─────────────────────────────────────────────────
     batch_size: int = 256 #test untuk google colab
     num_workers: int = 0 if os.name == "nt" else 2  # 0 on Windows to avoid hangs
-    epochs_teacher: int = 150
+    epochs_teacher: int = 100
     epochs_student: int = 80
     lr: float = 5e-5
     weight_decay: float = 1e-2
     early_stopping_patience: int = 150  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
+    noise_std: float = 0.05         # Standard deviation for Gaussian noise augmentation
 
     # ── Knowledge Distillation ─────────────────────────────────────────────
     temperature: float = 4.0        # Softmax temperature T

@@ -27,6 +27,7 @@ from scipy.signal import butter, decimate, sosfiltfilt
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from config import CFG
+from augmentation import add_gaussian_noise
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -185,9 +186,10 @@ class WESADDataset(Dataset):
     channel 1 is EDA — and ``label`` is an int in {0, 1, 2}.
     """
 
-    def __init__(self, subjects: List[str], cfg: CFG) -> None:
+    def __init__(self, subjects: List[str], cfg: CFG, augment: bool = False) -> None:
         super().__init__()
         self.cfg = cfg
+        self.augment = augment
 
         all_ecg, all_eda, all_labels = [], [], []
         for sid in subjects:
@@ -228,6 +230,10 @@ class WESADDataset(Dataset):
         ecg = torch.from_numpy(self.ecg[idx]).float()   # shape: (seq_len,)
         eda = torch.from_numpy(self.eda[idx]).float()   # shape: (seq_len,)
         x = torch.stack([ecg, eda], dim=0)              # shape: (2, seq_len)
+        
+        if self.augment:
+            x = add_gaussian_noise(x, std=self.cfg.noise_std)
+            
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         return x, label
 
@@ -309,10 +315,10 @@ def build_dataloaders(
         val_subjects = cfg.all_subjects[12:]
 
     print("[data_loader] Building training set ...")
-    train_ds = WESADDataset(train_subjects, cfg)
+    train_ds = WESADDataset(train_subjects, cfg, augment=True)
 
     print("[data_loader] Building validation set ...")
-    val_ds = WESADDataset(val_subjects, cfg)
+    val_ds = WESADDataset(val_subjects, cfg, augment=False)
 
     if wrap_missing:
         train_ds = MissingModalityWrapper(
