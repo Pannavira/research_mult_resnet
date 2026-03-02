@@ -1,27 +1,38 @@
 """
-train_kd.py — Two-phase training loop for the Missing-Modality KD framework.
+train_kd.py — Two-phase Cross-Modal Knowledge Distillation training loop.
 
-Phase 1  Train the Teacher (MulT + Deep1DResNet) on full multimodal data.
-Phase 2  Freeze the Teacher, train the Student with a combined KD loss
-         (CE + KL + MSE) while simulating missing modalities.
+Phase 1  Train the Teacher (6-modal ResNet+Transformer) on full privileged data.
+Phase 2  Freeze the Teacher; train Student (3-modal wrist) with combined KD loss.
+
+In Phase 2 every batch yields (x_teacher, x_student, y):
+    - Teacher receives x_teacher  (B, 6, seq_len)
+    - Student receives x_student  (B, 3, seq_len)
+
+KDLoss = α·CE(student, y) + β·KL(student_soft, teacher_soft)·T²
+         + γ·MSE_feat  (SE weights → projected → aligned to Teacher attention summary)
+
+Feature-alignment mechanism (MSE_feat):
+    Teacher returns attn_map: (B, heads, 6, 6).
+    We compute a compact summary: mean over heads, then mean over key-dim → (B, 6).
+    Student SE weights at each block: (B, C_i).
+    Tiny projectors map (B, C_i) → (B, 6) then MSE vs the teacher summary.
+    This enforces the student's channel importance to mimic inter-sensor attention.
 
 Usage
 -----
-    # Train with default config
-    python train_kd.py
-
-    # Quick smoke test (1 epoch, 2 subjects, small batch)
-    python train_kd.py --epochs 1 --batch_size 4 --subjects S2 S3
+    python train_kd.py                        # full both-phase training
+    python train_kd.py --phase teacher        # only train teacher
+    python train_kd.py --phase student --teacher_ckpt checkpoints/teacher_best.pt
+    python train_kd.py --epochs 1 --batch_size 4 --subjects S2 S3  # smoke test
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import gc
+import os
 import random
 import sys
-import time
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -32,22 +43,19 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-# ── AMP compatibility shim (works on CPU-only and older PyTorch builds) ────
+# ── AMP compatibility shim (CPU-safe + PyTorch ≥ 2.4) ────────────────────
 _USE_CUDA = torch.cuda.is_available()
 
 try:
-    # PyTorch ≥ 2.4 new-style API
     from torch.amp import GradScaler, autocast as _autocast
     def amp_autocast():
         return _autocast("cuda", enabled=_USE_CUDA)
 except ImportError:
     try:
-        # PyTorch < 2.4 legacy API
         from torch.cuda.amp import GradScaler, autocast as _autocast
         def amp_autocast():
             return _autocast(enabled=_USE_CUDA)
     except ImportError:
-        # CPU-only build — no AMP at all
         from contextlib import nullcontext
         class GradScaler:
             def __init__(self, **kwargs): pass
@@ -68,7 +76,6 @@ from student import StudentModel
 # ════════════════════════════════════════════════════════════════════════════
 
 def seed_everything(seed: int = 42) -> None:
-    """Set seeds for reproducibility across Python, NumPy and PyTorch."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -78,114 +85,106 @@ def seed_everything(seed: int = 42) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Knowledge-Distillation loss
+#  Knowledge-Distillation Loss
 # ════════════════════════════════════════════════════════════════════════════
 
 class KDLoss(nn.Module):
-    """Combined Knowledge Distillation loss.
+    """Combined Knowledge Distillation loss for Cross-Modal KD.
 
-    ``L = α · CE(student, y) + β · KL(student_soft, teacher_soft) · T²
-         + γ · MSE(student_feats, teacher_feats)``
+    L = α · CE(student, y)
+      + β · KL(student_soft, teacher_soft) · T²
+      + γ · MSE_feat
 
-    Feature-based MSE works as follows (memory-efficient):
-        1. Teacher attention ``(B, T', T')`` → mean over key-dim → ``(B, T')``
-        2. Average the two cross-attention maps → ``(B, T')``
-        3. Adaptive-pool ``T'`` down to a compact ``align_dim`` (default 64)
-        4. Project each student SE weight ``(B, C_i)`` → ``(B, align_dim)``
-        5. MSE between the projected SE weights and the compact attention summary
+    Feature-alignment (MSE_feat) strategy
+    ──────────────────────────────────────
+    Teacher attention_map:  (B, heads, 6, 6)
+        → mean over heads  → (B, 6, 6)
+        → mean over key-dim → (B, 6)       ← "teacher inter-sensor summary"
 
-    This preserves the feature-distillation signal while keeping projector
-    params tiny (~14K vs ~51M for the full-flattened approach).
+    Student SE weight (block i): (B, C_i)
+        → tiny Linear(C_i → 6)             ← projects to same 6-dim space
+        → MSE vs teacher inter-sensor summary
+
+    Why 6-dim alignment?  The teacher attends over 6 sensor tokens.
+    Forcing SE weights to predict the teacher's inter-sensor attention profile
+    transfers which sensors matter most — even though the student never sees
+    3 of those sensors.
+
+    Args:
+        cfg:            Configuration object (α, β, γ, T, num_classes).
+        student_dims:   List of SE output dims, e.g. [64, 128, 256].
+        n_teacher_mods: Number of teacher modalities (6) — projection target dim.
+        class_weights:  Optional class weight tensor for CE loss.
     """
 
-    # Compact alignment dimension (tune-free; 64 works well)
-    ALIGN_DIM = 64
+    # Fixed alignment target dim = number of teacher sensors
+    N_TEACHER = 6
 
     def __init__(
         self,
         cfg: CFG,
         student_dims: List[int],
-        teacher_attn_dim: int,          # kept for API compat (unused now)
+        n_teacher_mods: int = 6,
         class_weights: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         self.alpha = cfg.alpha
-        self.beta = cfg.beta
+        self.beta  = cfg.beta
         self.gamma = cfg.gamma
-        self.T = cfg.temperature
+        self.T     = cfg.temperature
 
         self.ce = nn.CrossEntropyLoss(weight=class_weights)
 
-        # Adaptive pool compresses teacher attention summary (T' → ALIGN_DIM)
-        self.attn_pool = nn.AdaptiveAvgPool1d(self.ALIGN_DIM)
-
-        # Tiny projectors: student SE weights → compact align space
-        # e.g. Linear(32→64), Linear(64→64), Linear(128→64)  — ~14K params
+        # Tiny linear projectors: SE_dim_i → N_TEACHER (6)
+        # e.g. Linear(64→6), Linear(128→6), Linear(256→6) ← very cheap (~1.2K params)
         self.projectors = nn.ModuleList([
-            nn.Linear(s_dim, self.ALIGN_DIM)
+            nn.Linear(s_dim, n_teacher_mods)
             for s_dim in student_dims
         ])
 
     def forward(
         self,
-        student_logits: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        student_se_weights: List[torch.Tensor],
-        teacher_attn_weights: List[torch.Tensor],
-        targets: torch.Tensor,
+        student_logits: torch.Tensor,           # (B, num_classes)
+        teacher_logits: torch.Tensor,           # (B, num_classes)  — detached
+        student_se_weights: List[torch.Tensor], # [(B, C_i)]
+        teacher_attn_map: torch.Tensor,         # (B, heads, 6, 6)
+        targets: torch.Tensor,                  # (B,)
     ) -> Tuple[torch.Tensor, dict]:
         """
-        Args:
-            student_logits: ``(B, C)``
-            teacher_logits: ``(B, C)``  — detached (teacher is frozen)
-            student_se_weights: list of ``(B, C_i)`` tensors
-            teacher_attn_weights: list of 2 attention matrices ``(B, T', T')``
-            targets: ``(B,)``  ground-truth labels
-
         Returns:
             total_loss: scalar
-            components: dict with ``'ce'``, ``'kl'``, ``'mse'`` for logging
+            components: dict with 'ce', 'kl', 'mse', 'total' for logging
         """
-        # ── Task loss (Cross-Entropy) ──────────────────────────────────────
+        # ── 1. Task loss ─────────────────────────────────────────────────
         loss_ce = self.ce(student_logits, targets)
 
-        # ── Response-based KD loss (KL Divergence) ─────────────────────────
-        student_soft = F.log_softmax(student_logits / self.T, dim=1)
-        teacher_soft = F.softmax(teacher_logits / self.T, dim=1)
-        loss_kl = F.kl_div(
-            student_soft, teacher_soft, reduction="batchmean"
-        ) * (self.T ** 2)
+        # ── 2. Response-based KD (KL Divergence) ─────────────────────────
+        s_soft = F.log_softmax(student_logits / self.T, dim=1)
+        t_soft = F.softmax(teacher_logits / self.T, dim=1)
+        loss_kl = F.kl_div(s_soft, t_soft, reduction="batchmean") * (self.T ** 2)
 
-        # ── Feature-based KD loss (MSE) ────────────────────────────────────
-        # Step 1: Compress each attention map (B, T', T') → mean over keys
-        #         → (B, T') = per-query attention summary
-        t_summaries = []
-        for attn in teacher_attn_weights:
-            t_summaries.append(attn.mean(dim=-1))   # shape: (B, T')
+        # ── 3. Feature-based KD (MSE) ─────────────────────────────────────
+        # Compute teacher inter-sensor attention summary: (B, 6)
+        #   attn_map: (B, heads, 6, 6)
+        #   → mean over heads → (B, 6, 6)
+        #   → mean over key-dim → (B, 6)
+        with torch.no_grad():
+            teacher_summary = teacher_attn_map.mean(dim=1)  # (B, 6, 6)
+            teacher_summary = teacher_summary.mean(dim=-1)   # (B, 6)
 
-        # Step 2: Average the two cross-attention summaries
-        teacher_summary = torch.stack(t_summaries, dim=0).mean(dim=0)
-        # teacher_summary shape: (B, T')
-
-        # Step 3: Adaptive pool T' → ALIGN_DIM (64)
-        teacher_compact = self.attn_pool(
-            teacher_summary.unsqueeze(1)             # shape: (B, 1, T')
-        ).squeeze(1)                                 # shape: (B, 64)
-
-        # Step 4: Align each SE weight with the compact attention target
         loss_mse = torch.tensor(0.0, device=student_logits.device)
         for proj, se_w in zip(self.projectors, student_se_weights):
-            projected = proj(se_w)                   # shape: (B, 64)
-            loss_mse = loss_mse + F.mse_loss(projected, teacher_compact.detach())
+            projected = proj(se_w)           # (B, 6)
+            loss_mse = loss_mse + F.mse_loss(projected, teacher_summary)
         loss_mse = loss_mse / len(self.projectors)
 
-        # ── Total ──────────────────────────────────────────────────────────
+        # ── 4. Total ──────────────────────────────────────────────────────
         total = self.alpha * loss_ce + self.beta * loss_kl + self.gamma * loss_mse
 
         components = {
-            "ce": loss_ce.item(),
-            "kl": loss_kl.item(),
-            "mse": loss_mse.item(),
+            "ce":    loss_ce.item(),
+            "kl":    loss_kl.item(),
+            "mse":   loss_mse.item(),
             "total": total.item(),
         }
         return total, components
@@ -196,14 +195,11 @@ class KDLoss(nn.Module):
 # ════════════════════════════════════════════════════════════════════════════
 
 def compute_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
-    """Top-1 accuracy in percent."""
     preds = logits.argmax(dim=1)
     return (preds == targets).float().mean().item() * 100.0
 
 
-def compute_f1(logits: torch.Tensor, targets: torch.Tensor,
-               num_classes: int = 3) -> float:
-    """Macro-averaged F1 score."""
+def compute_f1(logits: torch.Tensor, targets: torch.Tensor, num_classes: int = 2) -> float:
     preds = logits.argmax(dim=1)
     f1_per_class = []
     for c in range(num_classes):
@@ -211,281 +207,14 @@ def compute_f1(logits: torch.Tensor, targets: torch.Tensor,
         fp = ((preds == c) & (targets != c)).sum().float()
         fn = ((preds != c) & (targets == c)).sum().float()
         precision = tp / (tp + fp + 1e-8)
-        recall = tp / (tp + fn + 1e-8)
+        recall    = tp / (tp + fn + 1e-8)
         f1 = 2 * precision * recall / (precision + recall + 1e-8)
         f1_per_class.append(f1.item())
     return sum(f1_per_class) / num_classes
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Phase 1 — Train Teacher
-# ════════════════════════════════════════════════════════════════════════════
-
-def train_teacher(
-    teacher: TeacherModel,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    cfg: CFG,
-) -> TeacherModel:
-    """Train the Teacher model on full multimodal data.
-
-    Args:
-        teacher: Uninitialised Teacher model.
-        train_loader: Training data (full modality).
-        val_loader: Validation data.
-        cfg: Configuration.
-
-    Returns:
-        Trained Teacher model (best validation checkpoint).
-    """
-    device = cfg.device
-    teacher = teacher.to(device)
-
-    # ── Compute inverse-frequency class weights from training data ──────
-    train_ds = train_loader.dataset
-    # Unwrap MissingModalityWrapper if needed to access .labels
-    if hasattr(train_ds, 'base'):
-        train_ds = train_ds.base
-    labels = train_ds.labels  # numpy array from WESADDataset
-    class_counts = np.bincount(labels, minlength=cfg.num_classes).astype(np.float32)
-    class_weights = (1.0 / class_counts) * class_counts.sum() / cfg.num_classes
-    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
-    print(f"[Teacher] Class counts : {class_counts.astype(int).tolist()}")
-    print(f"[Teacher] Class weights: {class_weights.tolist()}")
-
-    optimizer = AdamW(teacher.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs_teacher)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    scaler = GradScaler() if _USE_CUDA else GradScaler()
-
-    best_val_f1 = 0.0
-    patience_counter = 0
-    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-
-    for epoch in range(1, cfg.epochs_teacher + 1):
-        # ── Train ──────────────────────────────────────────────────────────
-        teacher.train()
-        running_loss, running_correct, running_total = 0.0, 0, 0
-
-        for batch_idx, (x, y) in enumerate(train_loader):
-            x = x.to(device, non_blocking=True)  # shape: (B, 2, seq_len)
-            y = y.to(device, non_blocking=True)   # shape: (B,)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with amp_autocast():
-                logits, _, _ = teacher(x)          # shape: (B, num_classes)
-                loss = criterion(logits, y)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            running_loss += loss.item() * x.size(0)
-            running_correct += (logits.argmax(1) == y).sum().item()
-            running_total += x.size(0)
-
-        scheduler.step()
-        train_loss = running_loss / running_total
-        train_acc = running_correct / running_total * 100
-
-        # ── Validate ───────────────────────────────────────────────────────
-        val_loss, val_acc, val_f1 = evaluate(teacher, val_loader, criterion, cfg)
-
-        print(
-            f"[Teacher] Epoch {epoch:3d}/{cfg.epochs_teacher} │ "
-            f"Train Loss {train_loss:.4f}  Acc {train_acc:.1f}% │ "
-            f"Val Loss {val_loss:.4f}  Acc {val_acc:.1f}%  F1 {val_f1:.3f} │ "
-            f"LR {scheduler.get_last_lr()[0]:.2e}  "
-            f"ES {patience_counter}/{cfg.early_stopping_patience}"
-        )
-
-        # ── Early stopping on Macro-F1 ──────────────────────────────────────
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            patience_counter = 0
-            # Save best checkpoint (based on Macro-F1)
-            torch.save(
-                teacher.state_dict(),
-                os.path.join(cfg.checkpoint_dir, "teacher_best.pt"),
-            )
-        else:
-            patience_counter += 1
-
-        if patience_counter >= cfg.early_stopping_patience:
-            print(f"[Teacher] Early stopping triggered at epoch {epoch} "
-                  f"(val F1 did not improve for {cfg.early_stopping_patience} epochs)")
-            break
-
-    # Reload best
-    teacher.load_state_dict(
-        torch.load(os.path.join(cfg.checkpoint_dir, "teacher_best.pt"),
-                    map_location=device, weights_only=True)
-    )
-    print(f"[Teacher] Best val Macro-F1: {best_val_f1:.3f}")
-    return teacher
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  Phase 2 — Train Student with KD
-# ════════════════════════════════════════════════════════════════════════════
-
-def train_student_kd(
-    teacher: TeacherModel,
-    student: StudentModel,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    cfg: CFG,
-) -> StudentModel:
-    """Train the Student model via knowledge distillation from a frozen Teacher.
-
-    The training set should be wrapped with ``MissingModalityWrapper`` so
-    that the student learns to cope with dropped modalities.
-
-    Args:
-        teacher: Pre-trained (frozen) Teacher model.
-        student: Uninitialised Student model.
-        train_loader: Training data (with missing-modality simulation).
-        val_loader: Validation data (full modality, for fair comparison).
-        cfg: Configuration.
-
-    Returns:
-        Trained Student model (best validation checkpoint).
-    """
-    device = cfg.device
-    teacher = teacher.to(device).eval()
-    student = student.to(device)
-
-    # Freeze teacher
-    for p in teacher.parameters():
-        p.requires_grad = False
-
-    # Probe teacher to get attention map size
-    print("[KD] Probing teacher for attention map size ...")
-    with torch.no_grad():
-        probe_x = torch.randn(1, 2, cfg.seq_len, device=device)
-        _, attn1, attn2 = teacher(probe_x)
-        teacher_attn_dim = attn1.view(1, -1).size(1)  # T' * T'
-        del probe_x, attn1, attn2  # free probe tensors immediately
-    if _USE_CUDA:
-        torch.cuda.empty_cache()
-    print(f"[KD] Teacher attention flattened dim: {teacher_attn_dim}")
-    print(f"[KD] Using compact alignment dim: {KDLoss.ALIGN_DIM}")
-
-    # ── Compute inverse-frequency class weights from training data ──────
-    base_ds = train_loader.dataset
-    # Unwrap MissingModalityWrapper if needed to access .labels
-    if hasattr(base_ds, 'base'):
-        base_ds = base_ds.base
-    labels = base_ds.labels
-    class_counts = np.bincount(labels, minlength=cfg.num_classes).astype(np.float32)
-    class_weights = (1.0 / class_counts) * class_counts.sum() / cfg.num_classes
-    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
-    print(f"[KD] Class counts : {class_counts.astype(int).tolist()}")
-    print(f"[KD] Class weights: {class_weights.tolist()}")
-
-    # Build KD loss
-    student_dims = cfg.student_channels  # [32, 64, 128]
-    kd_loss_fn = KDLoss(cfg, student_dims, teacher_attn_dim,
-                        class_weights=class_weights).to(device)
-
-    # Optimizer covers both student parameters AND the projector parameters
-    all_params = list(student.parameters()) + list(kd_loss_fn.projectors.parameters())
-    optimizer = AdamW(all_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs_student)
-    scaler = GradScaler() if _USE_CUDA else GradScaler()
-
-    best_val_f1 = 0.0
-    criterion_val = nn.CrossEntropyLoss()
-
-    for epoch in range(1, cfg.epochs_student + 1):
-        # ── Train ──────────────────────────────────────────────────────────
-        student.train()
-        kd_loss_fn.train()
-        epoch_losses = {"ce": 0.0, "kl": 0.0, "mse": 0.0, "total": 0.0}
-        running_correct, running_total = 0, 0
-
-        num_batches = len(train_loader)
-        for batch_idx, (x, y) in enumerate(train_loader):
-            x = x.to(device, non_blocking=True)  # shape: (B, 2, seq_len)
-            y = y.to(device, non_blocking=True)   # shape: (B,)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with amp_autocast():
-                # Teacher forward (no grad)
-                with torch.no_grad():
-                    t_logits, t_attn1, t_attn2 = teacher(x)
-
-                # Student forward
-                s_logits, s_se_weights = student(x)
-
-                # KD loss
-                loss, comps = kd_loss_fn(
-                    student_logits=s_logits,
-                    teacher_logits=t_logits,
-                    student_se_weights=s_se_weights,
-                    teacher_attn_weights=[t_attn1, t_attn2],
-                    targets=y,
-                )
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            # Record metrics BEFORE freeing tensors
-            for k in epoch_losses:
-                epoch_losses[k] += comps[k] * x.size(0)
-            running_correct += (s_logits.argmax(1) == y).sum().item()
-            running_total += x.size(0)
-
-            # Free ALL intermediate tensors after use to save VRAM
-            del t_logits, t_attn1, t_attn2, s_logits, s_se_weights, loss, x, y
-
-            # Per-batch progress
-            print(f"\r  batch {batch_idx+1}/{num_batches} "
-                  f"loss={comps['total']:.4f}", end="", flush=True)
-        print()  # newline after progress
-
-        # Clear CUDA cache every 10 epochs to reduce fragmentation
-        if _USE_CUDA and epoch % 10 == 0:
-            torch.cuda.empty_cache()
-
-        scheduler.step()
-        for k in epoch_losses:
-            epoch_losses[k] /= running_total
-        train_acc = running_correct / running_total * 100
-
-        # ── Validate ───────────────────────────────────────────────────────
-        val_loss, val_acc, val_f1 = evaluate(student, val_loader, criterion_val, cfg)
-
-        print(
-            f"[Student] Epoch {epoch:3d}/{cfg.epochs_student} │ "
-            f"CE {epoch_losses['ce']:.4f}  KL {epoch_losses['kl']:.4f}  "
-            f"MSE {epoch_losses['mse']:.4f}  Total {epoch_losses['total']:.4f} │ "
-            f"Acc {train_acc:.1f}% │ "
-            f"Val Loss {val_loss:.4f}  Acc {val_acc:.1f}%  F1 {val_f1:.3f}"
-        )
-
-        # Save best (based on Macro-F1)
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            torch.save(
-                student.state_dict(),
-                os.path.join(cfg.checkpoint_dir, "student_best.pt"),
-            )
-
-    # Reload best
-    student.load_state_dict(
-        torch.load(os.path.join(cfg.checkpoint_dir, "student_best.pt"),
-                    map_location=device, weights_only=True)
-    )
-    print(f"[Student] Best val Macro-F1: {best_val_f1:.3f}")
-    return student
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  Evaluation helper
+#  Evaluation helper (works for both Teacher and Student)
 # ════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -494,8 +223,13 @@ def evaluate(
     loader: DataLoader,
     criterion: nn.Module,
     cfg: CFG,
+    use_teacher_input: bool = False,
 ) -> Tuple[float, float, float]:
     """Evaluate a model on the given loader.
+
+    Args:
+        use_teacher_input: If True, pass x_teacher to the model (eval teacher).
+                           If False, pass x_student (eval student).
 
     Returns:
         ``(avg_loss, accuracy_%, macro_f1)``
@@ -505,29 +239,280 @@ def evaluate(
     total_loss, total = 0.0, 0
     all_logits, all_targets = [], []
 
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+    for x_teacher, x_student, y in loader:
+        x_in = x_teacher if use_teacher_input else x_student
+        x_in = x_in.to(device, non_blocking=True)
+        y    = y.to(device, non_blocking=True)
 
-        # Handle both teacher (returns 3 vals) and student (returns 2 vals)
-        out = model(x)
+        out = model(x_in)
         logits = out[0] if isinstance(out, tuple) else out
 
         loss = criterion(logits, y)
-        total_loss += loss.item() * x.size(0)
-        total += x.size(0)
+        total_loss += loss.item() * x_in.size(0)
+        total += x_in.size(0)
 
         all_logits.append(logits.cpu())
         all_targets.append(y.cpu())
 
-    all_logits = torch.cat(all_logits, dim=0)
+    all_logits  = torch.cat(all_logits, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
 
     avg_loss = total_loss / total
-    acc = compute_accuracy(all_logits, all_targets)
-    f1 = compute_f1(all_logits, all_targets, cfg.num_classes)
+    acc      = compute_accuracy(all_logits, all_targets)
+    f1       = compute_f1(all_logits, all_targets, cfg.num_classes)
 
     return avg_loss, acc, f1
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Phase 1 — Train Teacher (6-modal input)
+# ════════════════════════════════════════════════════════════════════════════
+
+def train_teacher(
+    teacher: TeacherModel,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: CFG,
+) -> TeacherModel:
+    """Train the Teacher on all 6 privileged modalities.
+
+    Each batch from the loader yields (x_teacher, x_student, y).
+    Only x_teacher (B, 6, seq_len) and y are used here.
+
+    Returns the best Teacher (by val Macro-F1).
+    """
+    device = cfg.device
+    teacher = teacher.to(device)
+
+    # Inverse-frequency class weights
+    train_ds = train_loader.dataset
+    if hasattr(train_ds, "base"):
+        train_ds = train_ds.base
+    labels = train_ds.labels
+    class_counts = np.bincount(labels, minlength=cfg.num_classes).astype(np.float32)
+    class_weights = (1.0 / class_counts) * class_counts.sum() / cfg.num_classes
+    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    print(f"[Teacher] Class counts : {class_counts.astype(int).tolist()}")
+    print(f"[Teacher] Class weights: {class_weights.tolist()}")
+
+    optimizer = AdamW(teacher.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs_teacher)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    scaler    = GradScaler()
+
+    best_val_f1 = 0.0
+    patience_counter = 0
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+
+    for epoch in range(1, cfg.epochs_teacher + 1):
+        teacher.train()
+        running_loss, running_correct, running_total = 0.0, 0, 0
+
+        for batch_idx, (x_teacher_batch, _x_student, y) in enumerate(train_loader):
+            # Only use x_teacher (6-modal) and y in Phase 1
+            x = x_teacher_batch.to(device, non_blocking=True)  # (B, 6, seq_len)
+            y = y.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with amp_autocast():
+                logits, _attn = teacher(x)
+                loss = criterion(logits, y)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss    += loss.item() * x.size(0)
+            running_correct += (logits.argmax(1) == y).sum().item()
+            running_total   += x.size(0)
+
+        scheduler.step()
+        train_loss = running_loss    / running_total
+        train_acc  = running_correct / running_total * 100
+
+        val_loss, val_acc, val_f1 = evaluate(
+            teacher, val_loader, criterion, cfg, use_teacher_input=True
+        )
+
+        print(
+            f"[Teacher] Epoch {epoch:3d}/{cfg.epochs_teacher} │ "
+            f"Train Loss {train_loss:.4f}  Acc {train_acc:.1f}% │ "
+            f"Val Loss {val_loss:.4f}  Acc {val_acc:.1f}%  F1 {val_f1:.3f} │ "
+            f"LR {scheduler.get_last_lr()[0]:.2e}  "
+            f"ES {patience_counter}/{cfg.early_stopping_patience}"
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            patience_counter = 0
+            torch.save(
+                teacher.state_dict(),
+                os.path.join(cfg.checkpoint_dir, "teacher_best.pt"),
+            )
+        else:
+            patience_counter += 1
+
+        if patience_counter >= cfg.early_stopping_patience:
+            print(f"[Teacher] Early stopping at epoch {epoch}.")
+            break
+
+    teacher.load_state_dict(
+        torch.load(
+            os.path.join(cfg.checkpoint_dir, "teacher_best.pt"),
+            map_location=device, weights_only=True,
+        )
+    )
+    print(f"[Teacher] Best val Macro-F1: {best_val_f1:.3f}")
+    return teacher
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Phase 2 — Train Student with Cross-Modal KD
+# ════════════════════════════════════════════════════════════════════════════
+
+def train_student_kd(
+    teacher: TeacherModel,
+    student: StudentModel,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: CFG,
+) -> StudentModel:
+    """Train the wrist Student via knowledge distillation from the frozen Teacher.
+
+    Each batch yields (x_teacher, x_student, y):
+        - Teacher receives x_teacher (B, 6, seq_len)  → produces logits + attn_map
+        - Student receives x_student (B, 3, seq_len)  → produces logits + SE weights
+
+    KD loss aligns:
+        • Response: soft labels from teacher → student (KL)
+        • Feature:  teacher inter-sensor attention (B,6) → student SE weights (B,C)
+                    via tiny Linear projectors (barely any extra params)
+
+    Returns the best Student model (by val Macro-F1 using student wrist inputs).
+    """
+    device  = cfg.device
+    teacher = teacher.to(device).eval()
+    student = student.to(device)
+
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    # Class weights from training labels
+    base_ds = train_loader.dataset
+    if hasattr(base_ds, "base"):
+        base_ds = base_ds.base
+    labels = base_ds.labels
+    class_counts  = np.bincount(labels, minlength=cfg.num_classes).astype(np.float32)
+    class_weights = (1.0 / class_counts) * class_counts.sum() / cfg.num_classes
+    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    print(f"[KD] Class counts : {class_counts.astype(int).tolist()}")
+    print(f"[KD] Class weights: {class_weights.tolist()}")
+
+    # KD loss: projects each SE output to (B, 6) to align with teacher summary
+    n_teacher_mods = len(cfg.teacher_modalities)  # 6
+    student_dims   = cfg.student_channels          # e.g. [64, 128, 256]
+    kd_loss_fn = KDLoss(
+        cfg,
+        student_dims=student_dims,
+        n_teacher_mods=n_teacher_mods,
+        class_weights=class_weights,
+    ).to(device)
+
+    # Optimizer covers student params + projector params in KDLoss
+    all_params = list(student.parameters()) + list(kd_loss_fn.projectors.parameters())
+    optimizer  = AdamW(all_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler  = CosineAnnealingLR(optimizer, T_max=cfg.epochs_student)
+    scaler     = GradScaler()
+
+    best_val_f1   = 0.0
+    criterion_val = nn.CrossEntropyLoss()
+
+    for epoch in range(1, cfg.epochs_student + 1):
+        student.train()
+        kd_loss_fn.train()
+        epoch_losses = {"ce": 0.0, "kl": 0.0, "mse": 0.0, "total": 0.0}
+        running_correct, running_total = 0, 0
+
+        num_batches = len(train_loader)
+        for batch_idx, (x_teacher_batch, x_student_batch, y) in enumerate(train_loader):
+            x_t = x_teacher_batch.to(device, non_blocking=True)  # (B, 6, L)
+            x_s = x_student_batch.to(device, non_blocking=True)  # (B, 3, L)
+            y   = y.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with amp_autocast():
+                # Teacher forward — frozen, no grad
+                with torch.no_grad():
+                    t_logits, t_attn_map = teacher(x_t)  # (B,C), (B,heads,6,6)
+
+                # Student forward
+                s_logits, s_se_weights = student(x_s)    # (B,C), [(B,C_i)]
+
+                # KD loss
+                loss, comps = kd_loss_fn(
+                    student_logits=s_logits,
+                    teacher_logits=t_logits,
+                    student_se_weights=s_se_weights,
+                    teacher_attn_map=t_attn_map,
+                    targets=y,
+                )
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            for k in epoch_losses:
+                epoch_losses[k] += comps[k] * x_s.size(0)
+            running_correct += (s_logits.argmax(1) == y).sum().item()
+            running_total   += x_s.size(0)
+
+            # Free intermediate tensors proactively to reduce VRAM pressure
+            del t_logits, t_attn_map, s_logits, s_se_weights, loss, x_t, x_s, y
+
+            print(
+                f"\r  batch {batch_idx+1}/{num_batches} "
+                f"loss={comps['total']:.4f}", end="", flush=True
+            )
+        print()  # newline after progress bar
+
+        if _USE_CUDA and epoch % 10 == 0:
+            torch.cuda.empty_cache()
+
+        scheduler.step()
+        for k in epoch_losses:
+            epoch_losses[k] /= running_total
+        train_acc = running_correct / running_total * 100
+
+        # Validate student on wrist-only inputs (no missing mod at val time)
+        val_loss, val_acc, val_f1 = evaluate(
+            student, val_loader, criterion_val, cfg, use_teacher_input=False
+        )
+
+        print(
+            f"[Student] Epoch {epoch:3d}/{cfg.epochs_student} │ "
+            f"CE {epoch_losses['ce']:.4f}  KL {epoch_losses['kl']:.4f}  "
+            f"MSE {epoch_losses['mse']:.4f}  Total {epoch_losses['total']:.4f} │ "
+            f"Acc {train_acc:.1f}% │ "
+            f"Val Loss {val_loss:.4f}  Acc {val_acc:.1f}%  F1 {val_f1:.3f}"
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            torch.save(
+                student.state_dict(),
+                os.path.join(cfg.checkpoint_dir, "student_best.pt"),
+            )
+
+    student.load_state_dict(
+        torch.load(
+            os.path.join(cfg.checkpoint_dir, "student_best.pt"),
+            map_location=device, weights_only=True,
+        )
+    )
+    print(f"[Student] Best val Macro-F1: {best_val_f1:.3f}")
+    return student
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -536,12 +521,11 @@ def evaluate(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Missing-Modality KD — Teacher/Student Training"
+        description="Cross-Modal KD — Teacher (6-modal) / Student (3-modal wrist) Training"
     )
     parser.add_argument(
         "--phase", type=str, default="both",
         choices=["teacher", "student", "both"],
-        help="Which phase to run: 'teacher', 'student', or 'both'.",
     )
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override epoch count for both phases.")
@@ -549,19 +533,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument(
         "--subjects", type=str, nargs="+", default=None,
-        help="Subset of subjects to use (e.g. S2 S3). Default: all.",
+        help="Subset of subjects (e.g. S2 S3). Default: all.",
     )
     parser.add_argument("--teacher_ckpt", type=str, default=None,
-                        help="Path to pre-trained teacher checkpoint for "
-                             "Phase 2 only.")
+                        help="Pre-trained teacher checkpoint for Phase 2 only.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    cfg = CFG()
+    cfg  = CFG()
 
-    # Apply CLI overrides
     if args.epochs is not None:
         cfg.epochs_teacher = args.epochs
         cfg.epochs_student = args.epochs
@@ -574,46 +556,44 @@ def main() -> None:
 
     seed_everything(cfg.seed)
     device = cfg.device
-    print(f"[main] Device : {device}")
+    print(f"[main] Device  : {device}")
     print(f"[main] Subjects: {cfg.all_subjects}")
     print(f"[main] Batch   : {cfg.batch_size}")
+    print(f"[main] Teacher modalities ({len(cfg.teacher_modalities)}): {cfg.teacher_modalities}")
+    print(f"[main] Student modalities ({len(cfg.student_modalities)}): {cfg.student_modalities}")
 
-    # ── Split subjects: first ~80 % train, rest val ────────────────────────
     n = len(cfg.all_subjects)
     split = max(1, int(n * 0.8))
     train_subjects = cfg.all_subjects[:split]
-    val_subjects = cfg.all_subjects[split:] if split < n else cfg.all_subjects[-1:]
+    val_subjects   = cfg.all_subjects[split:] if split < n else cfg.all_subjects[-1:]
 
     print(f"[main] Train subjects: {train_subjects}")
     print(f"[main] Val   subjects: {val_subjects}")
 
     # ── Phase 1: Teacher ───────────────────────────────────────────────────
     teacher = TeacherModel(cfg)
-    print(f"[main] Teacher params: "
-          f"{sum(p.numel() for p in teacher.parameters()):,}")
+    print(f"[main] Teacher params: {sum(p.numel() for p in teacher.parameters()):,}")
 
     if args.phase in ("teacher", "both"):
         print("\n" + "=" * 72)
-        print("  PHASE 1 — Training Teacher")
+        print("  PHASE 1 — Training Teacher (6 modalities)")
         print("=" * 72)
-
+        # Teacher is trained WITHOUT missing-modality augmentation (it has privileged access)
         train_loader, val_loader = build_dataloaders(
             cfg,
             train_subjects=train_subjects,
             val_subjects=val_subjects,
-            wrap_missing=True,   # Teacher also trained with missing-modality augmentation
+            wrap_missing=False,
         )
         teacher = train_teacher(teacher, train_loader, val_loader, cfg)
 
     elif args.teacher_ckpt is not None:
-        # Load pre-trained teacher
         teacher.load_state_dict(
             torch.load(args.teacher_ckpt, map_location=device, weights_only=True)
         )
         teacher = teacher.to(device).eval()
         print(f"[main] Loaded teacher from {args.teacher_ckpt}")
     else:
-        # Try default checkpoint
         default_ckpt = os.path.join(cfg.checkpoint_dir, "teacher_best.pt")
         if os.path.exists(default_ckpt):
             teacher.load_state_dict(
@@ -629,31 +609,26 @@ def main() -> None:
 
     # ── Phase 2: Student with KD ──────────────────────────────────────────
     if args.phase in ("student", "both"):
-        # Free Phase 1 memory before starting Phase 2
         gc.collect()
         if _USE_CUDA:
             torch.cuda.empty_cache()
-            print(f"[main] CUDA memory free: "
-                  f"{torch.cuda.mem_get_info()[0] / 1024**2:.0f} MiB")
+            print(f"[main] CUDA free: {torch.cuda.mem_get_info()[0] / 1024**2:.0f} MiB")
 
         print("\n" + "=" * 72)
-        print("  PHASE 2 — Training Student (Knowledge Distillation)")
+        print("  PHASE 2 — Training Student (3 wrist modalities, KD from 6-modal Teacher)")
         print("=" * 72)
 
         student = StudentModel(cfg)
-        print(f"[main] Student params: "
-              f"{sum(p.numel() for p in student.parameters()):,}")
+        print(f"[main] Student params: {sum(p.numel() for p in student.parameters()):,}")
 
-        # Rebuild dataloaders WITH missing-modality simulation
+        # Student train loader uses MissingModalityWrapper (drops x_student channels)
         train_loader, val_loader = build_dataloaders(
             cfg,
             train_subjects=train_subjects,
             val_subjects=val_subjects,
-            wrap_missing=True,   # ← wraps train set with MissingModalityWrapper
+            wrap_missing=True,
         )
-        student = train_student_kd(
-            teacher, student, train_loader, val_loader, cfg,
-        )
+        student = train_student_kd(teacher, student, train_loader, val_loader, cfg)
 
     print("\n[main] Done! Checkpoints saved to:", cfg.checkpoint_dir)
 

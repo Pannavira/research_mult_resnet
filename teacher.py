@@ -1,25 +1,33 @@
 """
-teacher.py — Teacher model: Deep 1D-ResNet feature extractors + MulT cross-attention fusion.
+teacher.py — Teacher model: 6-branch Deep 1D-ResNet + Transformer Late Fusion.
 
 Architecture
 ------------
-ECG ──► Deep1DResNet(1→64→128→256) ──► feat_ecg  (B, 256, T')
-                                              │
-                                Cross-Attention (Q=ECG, K/V=EDA) ──► attn_weights_ecg2eda
-                                              │
-EDA ──► Deep1DResNet(1→64→128→256) ──► feat_eda  (B, 256, T')
-                                              │
-                                Cross-Attention (Q=EDA, K/V=ECG) ──► attn_weights_eda2ecg
-                                              │
-                                Cat + AdaptivePool + FC ──► logits (B, 3)
+For each of the 6 modalities:
+    sensor_i ──► Deep1DResNet(1→32→64→128) ──► GAP ──► token_i   (B, D)
 
-The forward pass returns ``(logits, attn_ecg2eda, attn_eda2ecg)`` so that
-attention weights can be used for feature-based knowledge distillation.
+Stack 6 tokens → (B, 6, D)
+     ──► nn.TransformerEncoder (Self-Attention across sensors)
+     ──► mean pooling over 6 tokens → (B, D)
+     ──► Classifier FC → logits (B, num_classes)
+
+The forward pass returns ``(logits, attn_map)`` where ``attn_map`` is the
+averaged attention weight matrix from the last TransformerEncoder layer,
+shape ``(B, num_heads, N_sensors, N_sensors)`` = ``(B, 4, 6, 6)``.
+This is consumed by KDLoss for feature alignment with Student SE weights.
+
+Why Late Fusion + TransformerEncoder instead of MulT Cross-Attention?
+    - MulT cross-attention on temporal sequences is O(T²) in memory.
+      For 6 modalities it would require 30 directional attention matrices.
+    - Here we first reduce each modality to a single D-dim token via GAP,
+      then apply self-attention over only 6 tokens: O(6²) = trivially cheap.
+    - The fusion step still captures inter-sensor dependencies globally.
 """
 
 from __future__ import annotations
 
 import math
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -33,18 +41,22 @@ from config import CFG
 # ════════════════════════════════════════════════════════════════════════════
 
 class ResidualBlock1D(nn.Module):
-    """Single residual block: two Conv1d layers with BatchNorm and skip.
-
-    If ``in_channels != out_channels`` a 1×1 projection is added to the skip
-    path so dimensions match.
+    """Single residual block: two Conv1d layers with InstanceNorm and skip.
 
     Args:
         in_channels: Number of input channels.
         out_channels: Number of output channels.
         stride: Stride for the first convolution (used for downsampling).
+        dropout: Dropout probability on inter-layer activations.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 2, dropout: float = 0.3) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 2,
+        dropout: float = 0.3,
+    ) -> None:
         super().__init__()
         self.conv1 = nn.Conv1d(
             in_channels, out_channels, kernel_size=7, stride=stride,
@@ -68,34 +80,30 @@ class ResidualBlock1D(nn.Module):
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: shape ``(B, C_in, L)``
-
-        Returns:
-            shape ``(B, C_out, L')`` where ``L' = L // stride``
-        """
-        identity = self.skip(x)       # shape: (B, C_out, L')
-        out = F.relu(self.bn1(self.conv1(x)))  # shape: (B, C_out, L')
-        out = self.dropout(out)                # ADDED DROPOUT
-        out = self.bn2(self.conv2(out))        # shape: (B, C_out, L')
-        return F.relu(out + identity)          # shape: (B, C_out, L')
+        identity = self.skip(x)
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.conv2(out))
+        return F.relu(out + identity)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Deep 1D-ResNet backbone (one per modality)
+#  Deep 1D-ResNet backbone (one per modality branch)
 # ════════════════════════════════════════════════════════════════════════════
 
 class Deep1DResNet(nn.Module):
-    """Deep 1-D ResNet backbone for a single modality channel.
+    """Deep 1-D ResNet backbone that maps a single modality (B,1,L) → (B,D).
 
     Structure:
-        Stem Conv → 3 Stages × (blocks_per_stage ResidualBlock1D)
+        Stem Conv → 3 Stages × (blocks_per_stage ResidualBlock1D) → GAP
+
+    The final Global Average Pooling collapses the temporal dimension so that
+    each modality produces a single D-dimensional token.
 
     Args:
-        in_channels: Number of input channels (1 for ECG or EDA).
-        stage_channels: List of output channels per stage, e.g. ``[64, 128, 256]``.
-        blocks_per_stage: Number of residual blocks per stage.
+        in_channels: Number of input channels (1 for each sensor).
+        stage_channels: Output channels per stage, e.g. [32, 64, 128].
+        blocks_per_stage: Residual blocks per stage.
     """
 
     def __init__(
@@ -106,7 +114,7 @@ class Deep1DResNet(nn.Module):
     ) -> None:
         super().__init__()
         if stage_channels is None:
-            stage_channels = [64, 128, 256]
+            stage_channels = [32, 64, 128]
 
         # Stem
         self.stem = nn.Sequential(
@@ -115,7 +123,7 @@ class Deep1DResNet(nn.Module):
             nn.InstanceNorm1d(stage_channels[0], affine=True),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
-        )  # output shape: (B, 64, L//4)
+        )
 
         # Stages
         stages = []
@@ -129,105 +137,106 @@ class Deep1DResNet(nn.Module):
             stages.append(nn.Sequential(*blocks))
         self.stages = nn.Sequential(*stages)
 
+        # Global Average Pooling → single token per modality
+        self.gap = nn.AdaptiveAvgPool1d(1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: shape ``(B, 1, seq_len)``
 
         Returns:
-            Feature map, shape ``(B, C_last, T')`` where ``T'`` is the
-            temporally downsampled length.
+            Token vector, shape ``(B, D)`` where D = stage_channels[-1]
         """
-        out = self.stem(x)        # shape: (B, 64, seq_len//4)
-        out = self.stages(out)    # shape: (B, 256, T')
-        return out
+        out = self.stem(x)        # (B, 32, L//4)
+        out = self.stages(out)    # (B, 128, T')
+        out = self.gap(out)       # (B, 128, 1)
+        return out.squeeze(-1)    # (B, 128)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Cross-Attention Layer (MulT-style)
+#  Attention-extracting TransformerEncoder wrapper
 # ════════════════════════════════════════════════════════════════════════════
 
-class CrossAttentionLayer(nn.Module):
-    """Multi-head cross-attention: query from one modality, key/value from another.
+class TransformerWithAttn(nn.Module):
+    """Wraps nn.TransformerEncoder to also return the last-layer attention map.
+
+    PyTorch's built-in TransformerEncoder doesn't expose attention weights
+    out of the box, so we manually run the layer stack and hook the last block.
 
     Args:
-        d_model: Feature dimension (must match the last ResNet channel).
-        n_heads: Number of attention heads.
-        dropout: Dropout on attention weights.
+        d_model: Token embedding dimension.
+        n_heads: Number of self-attention heads.
+        num_layers: Number of TransformerEncoderLayer blocks.
+        dim_feedforward: FFN hidden dim (defaults to 4×d_model).
+        dropout: Dropout probability.
     """
 
-    def __init__(self, d_model: int = 256, n_heads: int = 4,
-                 dropout: float = 0.5) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        num_layers: int = 2,
+        dim_feedforward: int | None = None,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=n_heads,
-            dropout=dropout, batch_first=True,
-        )
+        if dim_feedforward is None:
+            dim_feedforward = d_model * 4
+
+        # Build individual layers so we can extract attn from the last one
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True,  # Pre-LN for training stability
+            )
+            for _ in range(num_layers)
+        ])
         self.norm = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-            nn.Dropout(dropout),
-        )
-        self.norm2 = nn.LayerNorm(d_model)
 
     def forward(
-        self, query: torch.Tensor, key_value: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            query: shape ``(B, T_q, D)``  — from modality A
-            key_value: shape ``(B, T_kv, D)`` — from modality B
+            x: shape ``(B, N_tokens, D)``
 
         Returns:
-            output: shape ``(B, T_q, D)``
-            attn_weights: shape ``(B, T_q, T_kv)``
+            out: ``(B, N_tokens, D)`` — fused token representations
+            attn_map: ``(B, n_heads, N_tokens, N_tokens)`` — last-layer
+                      self-attention weight matrix
         """
-        # Multi-head cross-attention
-        attn_out, attn_weights = self.attn(
-            query, key_value, key_value, need_weights=True,
-            average_attn_weights=True,
-        )  # attn_out: (B, T_q, D), attn_weights: (B, T_q, T_kv)
+        out = x
+        for layer in self.layers[:-1]:
+            out = layer(out)
 
-        # Add & Norm
-        out = self.norm(query + attn_out)    # shape: (B, T_q, D)
-
-        # Feed-forward + Add & Norm
-        out = self.norm2(out + self.ffn(out))  # shape: (B, T_q, D)
-
-        return out, attn_weights
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  Positional Encoding (sinusoidal)
-# ════════════════════════════════════════════════════════════════════════════
-
-class PositionalEncoding1D(nn.Module):
-    """Inject temporal (sequence-order) information into a tensor."""
-
-    def __init__(self, d_model: int, max_len: int = 5000,
-                 dropout: float = 0.5) -> None:
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        # Last layer — extract attention weights manually
+        last_layer = self.layers[-1]
+        # Pre-LN (norm_first=True)
+        out_norm = last_layer.norm1(out)
+        # We call the underlying MHA directly with need_weights=True
+        attn_out, attn_weights = last_layer.self_attn(
+            out_norm, out_norm, out_norm,
+            need_weights=True,
+            average_attn_weights=False,   # keep per-head → (B, heads, N, N)
         )
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+        # Residual after attn
+        out = out + last_layer.dropout1(attn_out)
+        # FFN sub-layer (same as the layer's forward internals)
+        out = out + last_layer.dropout2(
+            last_layer.linear2(
+                last_layer.dropout(
+                    last_layer.activation(last_layer.linear1(last_layer.norm2(out)))
+                )
+            )
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor with shape ``(B, Seq_Len, D_model)``
-        """
-        x = x + self.pe[:x.size(1)].transpose(0, 1)
-        x = self.dropout(x)
-        return x
+        out = self.norm(out)
+        return out, attn_weights   # attn_weights: (B, heads, N, N)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -235,12 +244,16 @@ class PositionalEncoding1D(nn.Module):
 # ════════════════════════════════════════════════════════════════════════════
 
 class TeacherModel(nn.Module):
-    """MulT + Deep 1D-ResNet teacher for multimodal stress detection.
+    """Late-Fusion Teacher: 6 independent ResNet branches + TransformerEncoder.
 
-    Returns:
-        logits: ``(B, num_classes)``
-        attn_ecg2eda: ``(B, T', T')`` — attention weights where ECG queries EDA
-        attn_eda2ecg: ``(B, T', T')`` — attention weights where EDA queries ECG
+    Input shape:  ``(B, 6, seq_len)`` — 6 modalities stacked along channel dim.
+    Output:       ``(logits, attn_map)``
+        - logits:   ``(B, num_classes)``
+        - attn_map: ``(B, n_heads, 6, 6)`` — last Transformer layer attention
+
+    Modality ordering (must match data_loader):
+        0: chest_ecg  1: chest_eda  2: chest_resp
+        3: wrist_bvp  4: wrist_eda  5: wrist_temp
     """
 
     def __init__(self, cfg: CFG | None = None) -> None:
@@ -249,90 +262,75 @@ class TeacherModel(nn.Module):
             cfg = CFG()
         self.cfg = cfg
 
-        # Independent ResNet branches
-        self.resnet_ecg = Deep1DResNet(
-            in_channels=1,
-            stage_channels=cfg.resnet_channels,
-            blocks_per_stage=cfg.resnet_blocks_per_stage,
-        )
-        self.resnet_eda = Deep1DResNet(
-            in_channels=1,
-            stage_channels=cfg.resnet_channels,
-            blocks_per_stage=cfg.resnet_blocks_per_stage,
+        n_modalities = len(cfg.teacher_modalities)  # 6
+        d_model = cfg.attn_dim                       # 128
+
+        # 6 independent ResNet branches (one per sensor)
+        self.branches = nn.ModuleList([
+            Deep1DResNet(
+                in_channels=1,
+                stage_channels=cfg.resnet_channels,
+                blocks_per_stage=cfg.resnet_blocks_per_stage,
+            )
+            for _ in range(n_modalities)
+        ])
+
+        # Learnable modality type embedding (so the Transformer knows which
+        # token corresponds to which sensor)
+        self.modality_embed = nn.Embedding(n_modalities, d_model)
+
+        # Transformer fusion over 6 sensor tokens
+        self.transformer = TransformerWithAttn(
+            d_model=d_model,
+            n_heads=cfg.attn_heads,
+            num_layers=cfg.transformer_layers,
+            dropout=cfg.transformer_dropout,
         )
 
-        # Positional encoding (dropout=0.5 to prevent overfitting on small datasets)
-        self.pos_encoder = PositionalEncoding1D(d_model=cfg.attn_dim)
-
-        # Cross-attention layers
-        self.cross_attn_ecg2eda = CrossAttentionLayer(
-            d_model=cfg.attn_dim, n_heads=cfg.attn_heads,
-        )
-        self.cross_attn_eda2ecg = CrossAttentionLayer(
-            d_model=cfg.attn_dim, n_heads=cfg.attn_heads,
-        )
-
-        # Classification head
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        # Classification head: mean-pooled token → FC
         self.classifier = nn.Sequential(
-            nn.Linear(cfg.attn_dim * 2, cfg.attn_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(cfg.attn_dim, cfg.num_classes),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(d_model // 2, cfg.num_classes),
         )
 
     def forward(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            x: Input tensor, shape ``(B, 2, seq_len)``
-                Channel 0 = ECG, Channel 1 = EDA.
+            x: shape ``(B, N_modalities, seq_len)`` — 6 modalities
 
         Returns:
-            logits: ``(B, num_classes)``
-            attn_ecg2eda: ``(B, T', T')``
-            attn_eda2ecg: ``(B, T', T')``
+            logits:   ``(B, num_classes)``
+            attn_map: ``(B, n_heads, 6, 6)``
         """
-        # Split modalities — each (B, 1, seq_len)
-        ecg_in = x[:, 0:1, :]   # shape: (B, 1, seq_len)
-        eda_in = x[:, 1:2, :]   # shape: (B, 1, seq_len)
+        B, N, L = x.shape  # N == 6
 
-        # Feature extraction
-        feat_ecg = self.resnet_ecg(ecg_in)  # shape: (B, 256, T')
-        feat_eda = self.resnet_eda(eda_in)  # shape: (B, 256, T')
+        # ── Per-branch feature extraction ────────────────────────────────
+        # Each branch maps (B, 1, L) → (B, D)
+        tokens = []
+        for i, branch in enumerate(self.branches):
+            feat = branch(x[:, i:i+1, :])  # (B, D)
+            tokens.append(feat)
 
-        # Transpose to (B, T', D) for attention
-        feat_ecg_t = feat_ecg.permute(0, 2, 1)  # shape: (B, T', 256)
-        feat_eda_t = feat_eda.permute(0, 2, 1)  # shape: (B, T', 256)
+        # Stack → (B, N, D)
+        tokens = torch.stack(tokens, dim=1)  # (B, 6, D)
 
-        # Positional encoding — inject temporal info
-        feat_ecg_t = self.pos_encoder(feat_ecg_t)
-        feat_eda_t = self.pos_encoder(feat_eda_t)
+        # ── Add modality-type embeddings ─────────────────────────────────
+        idx = torch.arange(N, device=x.device)       # (6,)
+        mod_emb = self.modality_embed(idx)            # (6, D)
+        tokens = tokens + mod_emb.unsqueeze(0)        # (B, 6, D)
 
-        # Cross-attention: ECG queries EDA
-        fused_ecg, attn_ecg2eda = self.cross_attn_ecg2eda(
-            query=feat_ecg_t, key_value=feat_eda_t,
-        )  # fused_ecg: (B, T', 256), attn_ecg2eda: (B, T', T')
+        # ── Transformer sensor-level fusion ──────────────────────────────
+        fused, attn_map = self.transformer(tokens)    # fused: (B,6,D), attn: (B,H,6,6)
 
-        # Cross-attention: EDA queries ECG
-        fused_eda, attn_eda2ecg = self.cross_attn_eda2ecg(
-            query=feat_eda_t, key_value=feat_ecg_t,
-        )  # fused_eda: (B, T', 256), attn_eda2ecg: (B, T', T')
+        # ── Mean pooling over sensor tokens → classify ───────────────────
+        pooled = fused.mean(dim=1)                    # (B, D)
+        logits = self.classifier(pooled)              # (B, num_classes)
 
-        # Back to (B, D, T') for pooling
-        fused_ecg = fused_ecg.permute(0, 2, 1)  # shape: (B, 256, T')
-        fused_eda = fused_eda.permute(0, 2, 1)  # shape: (B, 256, T')
-
-        # Global average pooling
-        pool_ecg = self.pool(fused_ecg).squeeze(-1)  # shape: (B, 256)
-        pool_eda = self.pool(fused_eda).squeeze(-1)  # shape: (B, 256)
-
-        # Concatenate and classify
-        combined = torch.cat([pool_ecg, pool_eda], dim=1)  # shape: (B, 512)
-        logits = self.classifier(combined)                  # shape: (B, num_classes)
-
-        return logits, attn_ecg2eda, attn_eda2ecg
+        return logits, attn_map
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -342,10 +340,9 @@ class TeacherModel(nn.Module):
 if __name__ == "__main__":
     cfg = CFG()
     model = TeacherModel(cfg)
-    dummy = torch.randn(2, 2, cfg.seq_len)
-    logits, a1, a2 = model(dummy)
-    print(f"logits : {logits.shape}")     # (2, 3)
-    print(f"attn_e2d: {a1.shape}")        # (2, T', T')
-    print(f"attn_d2e: {a2.shape}")        # (2, T', T')
+    dummy = torch.randn(2, 6, cfg.seq_len)
+    logits, attn_map = model(dummy)
+    print(f"logits   : {logits.shape}")       # (2, 2)
+    print(f"attn_map : {attn_map.shape}")     # (2, 4, 6, 6)
     total = sum(p.numel() for p in model.parameters())
     print(f"Teacher params: {total:,}")

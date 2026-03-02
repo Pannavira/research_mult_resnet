@@ -1,7 +1,10 @@
 """
-config.py — Centralized hyperparameters for the Missing-Modality KD framework.
+config.py — Centralized hyperparameters for the Cross-Modal KD framework.
 
 All tunable constants live here so that every other module imports from one place.
+
+Teacher uses: chest_ecg, chest_eda, chest_resp, wrist_bvp, wrist_eda, wrist_temp (6 modal)
+Student uses: wrist_bvp, wrist_eda, wrist_temp (3 modal — on-device smartwatch)
 """
 
 import os
@@ -25,11 +28,36 @@ class CFG:
         ]
     )
 
+    # ── Modality definitions ─────────────────────────────────────────────────
+    # Teacher: 6 privileged sensors (chest + wrist).
+    # Each string is "<location>_<signal>" used by data_loader.
+    teacher_modalities: List[str] = field(
+        default_factory=lambda: [
+            "chest_ecg",   # Chest ECG
+            "chest_eda",   # Chest EDA
+            "chest_resp",  # Chest RESP
+            "wrist_bvp",   # Wrist BVP
+            "wrist_eda",   # Wrist EDA
+            "wrist_temp",  # Wrist TEMP
+        ]
+    )
+
+    # Student: 3 wrist-only sensors for on-device smartwatch.
+    student_modalities: List[str] = field(
+        default_factory=lambda: [
+            "wrist_bvp",   # Wrist BVP
+            "wrist_eda",   # Wrist EDA
+            "wrist_temp",  # Wrist TEMP
+        ]
+    )
+
     # ── Signal parameters ───────────────────────────────────────────────────
-    original_sr: int = 700          # RespiBAN chest sensor sampling rate (Hz)
-    target_sr: int = 128            # Downsample target (Hz)
+    # Chest sensors: 700 Hz; Wrist sensors: 64 Hz (E4 wristband).
+    chest_sr: int = 700             # Chest (RespiBAN) sampling rate (Hz)
+    wrist_sr: int = 64              # Wrist (E4) sampling rate (Hz)
+    target_sr: int = 128            # Downsample target (Hz) — NOTE: wrist is upsampled from 64
     window_sec: float = 60.0        # Sliding window duration (seconds)
-    overlap: float = 0.5            # Overlap fraction (50%). Lower = less memorization
+    overlap: float = 0.5            # Overlap fraction (50%)
     # Derived: seq_len = int(target_sr * window_sec) = 7680
     seq_len: int = 7680
 
@@ -47,8 +75,11 @@ class CFG:
     )
 
     # ── Filter design ──────────────────────────────────────────────────────
-    ecg_bandpass: tuple = (0.5, 40.0)   # Hz  (Butterworth band-pass)
-    eda_bandpass: tuple = (0.05, 5.0)   # Hz  (Bandpass: 0.05 Hz removes tonic drift)
+    ecg_bandpass: tuple = (0.5, 40.0)    # Hz — chest ECG
+    eda_bandpass: tuple = (0.05, 5.0)    # Hz — EDA (chest & wrist)
+    resp_bandpass: tuple = (0.1, 0.5)    # Hz — chest RESP (respiration rate band)
+    bvp_bandpass: tuple = (0.5, 8.0)     # Hz — wrist BVP (PPG signal)
+    temp_lowpass: float = 1.0            # Hz — wrist TEMP (skin temperature, slow signal)
     filter_order: int = 4
 
     # ── Training — general ─────────────────────────────────────────────────
@@ -74,20 +105,23 @@ class CFG:
     gamma: float = 1.0              # Weight for feature-based MSE loss (force SE→Attn match)
 
     # ── Missing-modality simulation ────────────────────────────────────────
-    missing_prob: float = 0.5       # Probability of dropping a modality
-    drop_modality: str = "random"      # Which modality to drop ("eda", "ecg", or "random")
+    missing_prob: float = 0.5       # Probability of dropping a modality (applied to student)
+    drop_modality: str = "random"   # Which student modality to drop ("random" or index 0,1,2)
 
     # ── Teacher architecture ───────────────────────────────────────────────
     resnet_channels: List[int] = field(
         default_factory=lambda: [32, 64, 128]
     )
     resnet_blocks_per_stage: int = 2
+    # TransformerEncoder for sensor-token fusion
     attn_heads: int = 4
     attn_dim: int = 128             # Must match last resnet channel
+    transformer_layers: int = 2     # Number of TransformerEncoder layers
+    transformer_dropout: float = 0.1
 
     # ── Student architecture ───────────────────────────────────────────────
     student_channels: List[int] = field(
-        default_factory=lambda: [64, 128, 256]  # 2x capacity for augmented data
+        default_factory=lambda: [64, 128, 256]  # 2x capacity vs original
     )
     se_reduction: int = 4
 
