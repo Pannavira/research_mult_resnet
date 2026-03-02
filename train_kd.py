@@ -258,8 +258,7 @@ def train_teacher(
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     scaler = GradScaler() if _USE_CUDA else GradScaler()
 
-    best_val_acc = 0.0
-    best_val_loss = float("inf")
+    best_val_f1 = 0.0
     patience_counter = 0
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
@@ -301,32 +300,29 @@ def train_teacher(
             f"ES {patience_counter}/{cfg.early_stopping_patience}"
         )
 
-        # ── Early stopping on val loss ─────────────────────────────────────
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # ── Early stopping on Macro-F1 ──────────────────────────────────────
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
             patience_counter = 0
+            # Save best checkpoint (based on Macro-F1)
+            torch.save(
+                teacher.state_dict(),
+                os.path.join(cfg.checkpoint_dir, "teacher_best.pt"),
+            )
         else:
             patience_counter += 1
 
         if patience_counter >= cfg.early_stopping_patience:
             print(f"[Teacher] Early stopping triggered at epoch {epoch} "
-                  f"(val loss did not improve for {cfg.early_stopping_patience} epochs)")
+                  f"(val F1 did not improve for {cfg.early_stopping_patience} epochs)")
             break
-
-        # Save best (based on val accuracy)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(
-                teacher.state_dict(),
-                os.path.join(cfg.checkpoint_dir, "teacher_best.pt"),
-            )
 
     # Reload best
     teacher.load_state_dict(
         torch.load(os.path.join(cfg.checkpoint_dir, "teacher_best.pt"),
                     map_location=device, weights_only=True)
     )
-    print(f"[Teacher] Best val accuracy: {best_val_acc:.1f}%")
+    print(f"[Teacher] Best val Macro-F1: {best_val_f1:.3f}")
     return teacher
 
 
@@ -399,7 +395,7 @@ def train_student_kd(
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs_student)
     scaler = GradScaler() if _USE_CUDA else GradScaler()
 
-    best_val_acc = 0.0
+    best_val_f1 = 0.0
     criterion_val = nn.CrossEntropyLoss()
 
     for epoch in range(1, cfg.epochs_student + 1):
@@ -471,9 +467,9 @@ def train_student_kd(
             f"Val Loss {val_loss:.4f}  Acc {val_acc:.1f}%  F1 {val_f1:.3f}"
         )
 
-        # Save best
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Save best (based on Macro-F1)
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
             torch.save(
                 student.state_dict(),
                 os.path.join(cfg.checkpoint_dir, "student_best.pt"),
@@ -484,7 +480,7 @@ def train_student_kd(
         torch.load(os.path.join(cfg.checkpoint_dir, "student_best.pt"),
                     map_location=device, weights_only=True)
     )
-    print(f"[Student] Best val accuracy: {best_val_acc:.1f}%")
+    print(f"[Student] Best val Macro-F1: {best_val_f1:.3f}")
     return student
 
 

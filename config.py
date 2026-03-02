@@ -62,6 +62,11 @@ class CFG:
     seed: int = 42
     noise_std: float = 0.1          # Standard deviation for Gaussian noise augmentation
 
+    # ── Personalization (subject calibration) ──────────────────────────
+    personalize: bool = False       # Whether to fine-tune using test subject baseline
+    personalize_baseline_minutes: float = 2.0  # Minutes of baseline data to mix in
+    personalize_finetune_epochs: int = 5       # Quick fine-tune epochs on mixed data
+
     # ── Knowledge Distillation ─────────────────────────────────────────────
     temperature: float = 4.0        # Softmax temperature T
     alpha: float = 0.5              # Weight for task CE loss
@@ -74,11 +79,11 @@ class CFG:
 
     # ── Teacher architecture ───────────────────────────────────────────────
     resnet_channels: List[int] = field(
-        default_factory=lambda: [32, 64, 128]
+        default_factory=lambda: [16, 32, 64]  # Smaller model to reduce overfitting
     )
     resnet_blocks_per_stage: int = 2
     attn_heads: int = 4
-    attn_dim: int = 128             # Must match last resnet channel
+    attn_dim: int = 64              # Must match last resnet channel
 
     # ── Student architecture ───────────────────────────────────────────────
     student_channels: List[int] = field(

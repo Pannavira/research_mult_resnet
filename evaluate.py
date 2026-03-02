@@ -44,7 +44,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from config import CFG
-from data_loader import WESADDataset, MissingModalityWrapper, build_dataloaders
+from data_loader import (WESADDataset, MissingModalityWrapper,
+                         build_dataloaders, extract_baseline_windows)
 from teacher import TeacherModel
 from student import StudentModel
 from train_kd import (
@@ -211,6 +212,7 @@ def run_fold(
     cfg: CFG,
     phase: str = "both",
     teacher_ckpt: Optional[str] = None,
+    personalize: bool = False,
 ) -> FoldResult:
     """Run a single LOSO fold: train on all subjects except test_subject,
     then evaluate Teacher + Student under various modality conditions.
@@ -249,7 +251,21 @@ def run_fold(
     actual_train = train_subjects[:-2]
 
     print(f"  Loading train data ({actual_train}) ...")
-    train_ds = WESADDataset(actual_train, cfg)
+    train_ds = WESADDataset(actual_train, cfg, augment=True)
+
+    # ── Personalization: mix test subject's baseline into train ─────
+    if personalize:
+        bl_ecg, bl_eda, bl_lbl = extract_baseline_windows(
+            test_subject, cfg,
+            minutes=cfg.personalize_baseline_minutes,
+        )
+        if len(bl_lbl) > 0:
+            import numpy as _np
+            train_ds.ecg = _np.concatenate([train_ds.ecg, bl_ecg], axis=0)
+            train_ds.eda = _np.concatenate([train_ds.eda, bl_eda], axis=0)
+            train_ds.labels = _np.concatenate([train_ds.labels, bl_lbl], axis=0)
+            print(f"  [personalize] Training set expanded to {len(train_ds)} windows")
+
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
         num_workers=cfg.num_workers, pin_memory=torch.cuda.is_available(),
@@ -547,6 +563,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override epochs for per-fold training.")
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--personalize", action="store_true", default=False,
+                        help="Mix test subject baseline data into training "
+                             "(short calibration for subject adaptation).")
     return parser.parse_args()
 
 
@@ -566,6 +585,9 @@ def main() -> None:
     print(f"[evaluate] Device  : {cfg.device}")
     print(f"[evaluate] Subjects: {subjects}")
     print(f"[evaluate] Phase   : {args.phase}")
+    print(f"[evaluate] Personal: {args.personalize}")
+    if args.personalize:
+        cfg.personalize = True
 
     start_time = time.time()
 
@@ -588,6 +610,7 @@ def main() -> None:
             cfg=cfg,
             phase=args.phase,
             teacher_ckpt=args.teacher_ckpt,
+            personalize=args.personalize,
         )
         fold_results.append(result)
 

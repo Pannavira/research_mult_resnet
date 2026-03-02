@@ -44,7 +44,7 @@ class ResidualBlock1D(nn.Module):
         stride: Stride for the first convolution (used for downsampling).
     """
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 2, dropout: float = 0.3) -> None:
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 2, dropout: float = 0.5) -> None:
         super().__init__()
         self.conv1 = nn.Conv1d(
             in_channels, out_channels, kernel_size=7, stride=stride,

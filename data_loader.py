@@ -27,7 +27,7 @@ from scipy.signal import butter, decimate, sosfiltfilt
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from config import CFG
-from augmentation import add_gaussian_noise
+from augmentation import augment_signal
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -234,7 +234,7 @@ class WESADDataset(Dataset):
         x = torch.stack([ecg, eda], dim=0)              # shape: (2, seq_len)
         
         if self.augment:
-            x = add_gaussian_noise(x, std=self.cfg.noise_std)
+            x = augment_signal(x, noise_std=self.cfg.noise_std)
             
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         return x, label
@@ -366,3 +366,68 @@ def build_loso_splits(cfg: CFG):
             val_subjects=val_subjects,
         )
         yield test_subj, train_loader, val_loader
+
+
+def extract_baseline_windows(
+    subject_id: str,
+    cfg: CFG,
+    minutes: float = 2.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract the first ``minutes`` of *baseline* data from a subject.
+
+    This is used for personalization / calibration: a small amount of the
+    test subject's baseline (non-stress) data is mixed into the training
+    set so the model can adapt to subject-specific signal characteristics.
+
+    Only windows whose majority label maps to baseline (label_map value 0)
+    are kept, and only the first ``minutes`` worth of raw baseline samples
+    are used (before windowing).
+
+    Args:
+        subject_id: WESAD subject ID, e.g. ``"S10"``.
+        cfg: Configuration object.
+        minutes: How many minutes of baseline to extract.
+
+    Returns:
+        ``(ecg_wins, eda_wins, labels)`` — numpy arrays ready to be
+        concatenated with existing training data.
+    """
+    raw = _load_subject(subject_id, cfg)
+
+    ds_factor = cfg.original_sr // cfg.target_sr
+    ecg_ds = _downsample(raw["ecg"], cfg.original_sr, cfg.target_sr)
+    eda_ds = _downsample(raw["eda"], cfg.original_sr, cfg.target_sr)
+    lbl_ds = raw["label"][::ds_factor]
+
+    min_len = min(len(ecg_ds), len(eda_ds), len(lbl_ds))
+    ecg_ds, eda_ds, lbl_ds = ecg_ds[:min_len], eda_ds[:min_len], lbl_ds[:min_len]
+
+    # Z-score normalize (same as training pipeline)
+    ecg_ds = (ecg_ds - ecg_ds.mean()) / (ecg_ds.std() + 1e-8)
+    eda_ds = (eda_ds - eda_ds.mean()) / (eda_ds.std() + 1e-8)
+
+    # Keep only baseline samples (original label == 1)
+    baseline_mask = (lbl_ds == 1)
+    max_samples = int(minutes * 60 * cfg.target_sr)
+
+    # Find contiguous baseline region and take only first N samples
+    baseline_indices = np.where(baseline_mask)[0]
+    if len(baseline_indices) == 0:
+        # No baseline data — return empty arrays
+        return (np.zeros((0, cfg.seq_len), dtype=np.float32),
+                np.zeros((0, cfg.seq_len), dtype=np.float32),
+                np.zeros((0,), dtype=np.int64))
+
+    # Limit to first `max_samples` baseline samples
+    baseline_indices = baseline_indices[:max_samples]
+    ecg_bl = ecg_ds[baseline_indices]
+    eda_bl = eda_ds[baseline_indices]
+    lbl_bl = lbl_ds[baseline_indices]
+
+    # Segment into windows
+    ecg_w, eda_w, lbl_w = _segment_windows(ecg_bl, eda_bl, lbl_bl, cfg)
+
+    print(f"  [personalize] Extracted {len(lbl_w)} baseline windows "
+          f"({minutes:.1f} min) from {subject_id}")
+    return ecg_w, eda_w, lbl_w
+
