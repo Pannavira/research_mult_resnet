@@ -1,4 +1,4 @@
-# Missing-Modality Knowledge Distillation for Stress Detection
+# Missing-Modality Knowledge Distillation for Stress Detections
 
 A deep learning framework for **wearable stress detection** using the [WESAD dataset](https://ubicomp.eti.uni-siegen.de/home/datasets/icmi18/). The system trains a large **Teacher model** (Deep 1D-ResNet + Multimodal Transformer) and distills its knowledge into a lightweight **Student model** (Depthwise Separable CNN + Squeeze-and-Excitation blocks) that is robust to **missing sensor modalities**.
 
