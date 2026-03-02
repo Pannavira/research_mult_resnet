@@ -122,7 +122,13 @@ _MODALITY_META: Dict[str, Tuple[str, str, int]] = {
 
 
 def _extract_modality(data: dict, modality: str, cfg: CFG) -> np.ndarray:
-    """Extract, filter, and resample a single modality to target_sr.
+    """Extract, resample, then filter a single modality to target_sr.
+
+    Order: resample FIRST → filter SECOND.
+    Reason: low-rate wrist sensors (EDA/TEMP at 4 Hz, BVP at 64 Hz) have a
+    Nyquist frequency that is lower than some filter cutoffs (e.g. EDA highcut
+    5 Hz > Nyquist 2 Hz at 4 Hz).  By resampling to target_sr=128 Hz first,
+    the Nyquist becomes 64 Hz, which is safely above all filter cutoffs.
 
     Args:
         data:     Raw pickle dict for one subject.
@@ -135,9 +141,12 @@ def _extract_modality(data: dict, modality: str, cfg: CFG) -> np.ndarray:
     location, signal_key, native_sr = _MODALITY_META[modality]
     raw = data["signal"][location][signal_key].squeeze().astype(np.float64)
 
-    filtered = _filter_signal(raw, modality, native_sr, cfg)
-    resampled = _resample_signal(filtered, native_sr, cfg.target_sr)
-    return resampled
+    # Step 1: resample to target_sr (handles both up- and down-sampling)
+    resampled = _resample_signal(raw, native_sr, cfg.target_sr)
+
+    # Step 2: filter at target_sr (Nyquist = target_sr/2 = 64 Hz — safe for all cutoffs)
+    filtered = _filter_signal(resampled, modality, cfg.target_sr, cfg)
+    return filtered
 
 
 # ════════════════════════════════════════════════════════════════════════════
