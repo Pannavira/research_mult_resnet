@@ -234,7 +234,7 @@ class WESADDataset(Dataset):
         x = torch.stack([ecg, eda], dim=0)              # shape: (2, seq_len)
         
         if self.augment:
-            x = augment_signal(x, noise_std=self.cfg.noise_std, p_permutation=0.0)
+            x = augment_signal(x, noise_std=self.cfg.noise_std, p_scaling=0.7, p_permutation=0.5)
             
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         return x, label

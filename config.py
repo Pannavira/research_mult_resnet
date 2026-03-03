@@ -28,10 +28,10 @@ class CFG:
     # ── Signal parameters ───────────────────────────────────────────────────
     original_sr: int = 700          # RespiBAN chest sensor sampling rate (Hz)
     target_sr: int = 128            # Downsample target (Hz)
-    window_sec: float = 60.0        # Sliding window duration (seconds)
-    overlap: float = 0.5            # Overlap fraction (50%). Lower = less memorization
-    # Derived: seq_len = int(target_sr * window_sec) = 7680
-    seq_len: int = 7680
+    window_sec: float = 30.0        # Sliding window duration (seconds)
+    overlap: float = 0.5            # Overlap fraction (50%). Higher = more training windows
+    # Derived: seq_len = int(target_sr * window_sec) = 128 * 30 = 3840
+    seq_len: int = 3840
 
     # ── Label mapping ──────────────────────────────────────────────────────
     #   Original WESAD labels: 0=not defined, 1=baseline, 2=stress,
@@ -60,7 +60,7 @@ class CFG:
     weight_decay: float = 1e-2
     early_stopping_patience: int = 25  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
-    noise_std: float = 0.1          # Standard deviation for Gaussian noise augmentation
+    noise_std: float = 0.05         # Standard deviation for Gaussian noise augmentation
 
     # ── Personalization (subject calibration) ──────────────────────────
     personalize: bool = False       # Whether to fine-tune using test subject baseline
@@ -79,11 +79,11 @@ class CFG:
 
     # ── Teacher architecture ───────────────────────────────────────────────
     resnet_channels: List[int] = field(
-        default_factory=lambda: [32, 64, 128]
+        default_factory=lambda: [64, 128, 256]
     )
-    resnet_blocks_per_stage: int = 2
-    attn_heads: int = 4
-    attn_dim: int = 128             # Must match last resnet channel
+    resnet_blocks_per_stage: int = 3
+    attn_heads: int = 8
+    attn_dim: int = 256             # Must match last resnet channel
 
     # ── Student architecture ───────────────────────────────────────────────
     student_channels: List[int] = field(

@@ -44,7 +44,7 @@ class ResidualBlock1D(nn.Module):
         stride: Stride for the first convolution (used for downsampling).
     """
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 2, dropout: float = 0.3) -> None:
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 2, dropout: float = 0.1) -> None:
         super().__init__()
         self.conv1 = nn.Conv1d(
             in_channels, out_channels, kernel_size=7, stride=stride,
@@ -157,7 +157,7 @@ class CrossAttentionLayer(nn.Module):
     """
 
     def __init__(self, d_model: int = 256, n_heads: int = 4,
-                 dropout: float = 0.5) -> None:
+                 dropout: float = 0.1) -> None:
         super().__init__()
         self.attn = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=n_heads,
@@ -208,7 +208,7 @@ class PositionalEncoding1D(nn.Module):
     """Inject temporal (sequence-order) information into a tensor."""
 
     def __init__(self, d_model: int, max_len: int = 5000,
-                 dropout: float = 0.5) -> None:
+                 dropout: float = 0.1) -> None:
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
         position = torch.arange(max_len).unsqueeze(1)
@@ -277,7 +277,7 @@ class TeacherModel(nn.Module):
         self.classifier = nn.Sequential(
             nn.Linear(cfg.attn_dim * 2, cfg.attn_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
+            nn.Dropout(0.1),
             nn.Linear(cfg.attn_dim, cfg.num_classes),
         )
 
@@ -349,3 +349,4 @@ if __name__ == "__main__":
     print(f"attn_d2e: {a2.shape}")        # (2, T', T')
     total = sum(p.numel() for p in model.parameters())
     print(f"Teacher params: {total:,}")
+    print(f"seq_len       : {cfg.seq_len}  ({cfg.window_sec}s @ {cfg.target_sr}Hz)")
