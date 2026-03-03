@@ -255,7 +255,7 @@ def train_teacher(
 
     optimizer = AdamW(teacher.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs_teacher)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     scaler = GradScaler() if _USE_CUDA else GradScaler()
 
     best_val_f1 = 0.0
@@ -323,6 +323,13 @@ def train_teacher(
                     map_location=device, weights_only=True)
     )
     print(f"[Teacher] Best val Macro-F1: {best_val_f1:.3f}")
+
+    # ── Diagnostic prints (training only, no architecture change) ───────
+    final_lr = scheduler.get_last_lr()[0]
+    total_params = sum(p.numel() for p in teacher.parameters())
+    print(f"[Teacher] Final learning rate : {final_lr:.2e}")
+    print(f"[Teacher] Total parameters    : {total_params:,}")
+
     return teacher
 
 

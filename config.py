@@ -54,11 +54,11 @@ class CFG:
     # ── Training — general ─────────────────────────────────────────────────
     batch_size: int = 32
     num_workers: int = 4 # 0 on Windows to avoid hangs
-    epochs_teacher: int = 100
+    epochs_teacher: int = 150
     epochs_student: int = 80
-    lr: float = 1e-4
+    lr: float = 5e-5
     weight_decay: float = 1e-2
-    early_stopping_patience: int = 25  # Stop if val loss doesn't improve for N epochs
+    early_stopping_patience: int = 50  # Stop if val loss doesn't improve for N epochs
     seed: int = 42
     noise_std: float = 0.05         # Standard deviation for Gaussian noise augmentation
 
